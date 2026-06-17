@@ -10,26 +10,29 @@ It performs three steps:
   1. Looks up the facility's eClaimLink credentials
      (`Facility.eclaimlink_username` / `Facility.credential_key` /
      `Facility.dhpo_provider_id`).
-  2. Calls `_fetch_transactions(...)` for each of ClaimSubmission and
-     RemittanceAdvice, staging any returned XML payloads into
-     `raw_xml_store` (parse_status="pending").
-  3. Runs `DHPOXmlParser.run_pending(...)` to normalize newly staged (and
-     any previously pending) records, then finalizes a `FetchLog` row with
+  2. Calls `_fetch_transactions(...)` for ClaimSubmission and RemittanceAdvice
+     via the DHPO SOAP web service (ValidateTransactions.asmx), staging any
+     returned XML payloads into `raw_xml_store` (parse_status="pending").
+  3. Runs `DHPOXmlParser.run_pending(...)` to normalize newly staged (and any
+     previously pending) records, then finalises a `FetchLog` row with
      fetch/parse/error counts.
 
-NOTE — `_fetch_transactions` is a scaffold. The DHPO/eClaimLink portal
-(https://eclaimlink.ae) exposes a SOAP web service whose WSDL, operation
-names, and auth scheme are issued per-payer/per-facility. Implement the
-actual SOAP/REST call here using `facility.eclaimlink_username` and
-`facility.credential_key` (e.g. with `zeep` for SOAP). Until implemented,
-this returns an empty list per xml_type — `run_sync_pipeline` still runs
-the parser over anything already staged via manual upload, so the
-"Trigger DHA XML Sync" action remains useful out of the box.
+DHPO SOAP web service (spec V3, effective July 6 2017):
+  Live:    https://dhpo.eclaimlink.ae/ValidateTransactions.asmx
+  Archive: https://dhpo.eclaimlink.ae/ClaimsAndAuthorizationsArchive.asmx
+  (Archive uses identical signatures but different URL; serves data older
+  than the live retention window — Claims >24 months, PA/Rx/Referral >6 months.)
+
+PAREQ and PA AUTH endpoints are intentionally excluded.
+
+Requires:  pip install zeep
 """
 from __future__ import annotations
 
+import io
 import logging
-from datetime import date, datetime
+import zipfile
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine
@@ -40,20 +43,269 @@ from .dhpo_parser import DHPOXmlParser
 
 log = logging.getLogger(__name__)
 
+# ----------------------------------------------------------------------------
+# DHPO SOAP service URLs (spec V3, July 2017)
+# ----------------------------------------------------------------------------
+DHPO_LIVE_WSDL    = "https://dhpo.eclaimlink.ae/ValidateTransactions.asmx?wsdl"
+DHPO_ARCHIVE_WSDL = "https://dhpo.eclaimlink.ae/ClaimsAndAuthorizationsArchive.asmx?wsdl"
+
+# TransactionID bitmask values per spec
+TX_CLAIM_SUBMISSION  = 2   # Claim.Submission
+TX_REMITTANCE_ADVICE = 8   # Remittance.Advice
+# 16 = Prior.Request  )  excluded per requirements — PAREQ & PA AUTH NOT NEEDED
+# 32 = Prior.Authorization )
+
+# direction: 1 = sent only, 2 = received only
+DIRECTION_SENT     = 1
+DIRECTION_RECEIVED = 2
+
+# Successful return codes (0 = success, 1 = success with warnings, 2/3 = no new data)
+DHPO_OK_CODES = {0, 1, 2, 3}
+
+# XML types handled
 XML_TYPES = ("ClaimSubmission", "RemittanceAdvice")
 
 
+# ----------------------------------------------------------------------------
+# DHPO SOAP client wrapper
+# ----------------------------------------------------------------------------
+class DHPOSoapClient:
+    """
+    Thin wrapper around the DHPO SOAP web service (zeep-based).
+
+    All calls normalise DHPO return codes and raise RuntimeError on failure.
+    """
+
+    def __init__(self, wsdl_url: str, timeout: int = 60):
+        try:
+            from zeep import Client
+            from zeep.transports import Transport
+            import requests as _requests
+        except ImportError as exc:
+            raise ImportError(
+                "zeep is required for DHPO SOAP calls. "
+                "Run: pip install zeep  (inside the backend venv)"
+            ) from exc
+
+        session = _requests.Session()
+        session.verify = True  # enforce TLS verification
+        transport = Transport(session=session, timeout=timeout, operation_timeout=timeout)
+        self._client = Client(wsdl_url, transport=transport)
+        self._wsdl_url = wsdl_url
+
+    # ------------------------------------------------------------------
+    # GetNewTransactions — returns list of undownloaded transactions
+    # ------------------------------------------------------------------
+    def get_new_transactions(self, login: str, pwd: str) -> List[Dict]:
+        """
+        Calls GetNewTransactions and returns a list of file descriptor dicts.
+        Each dict: {file_id, file_name, sender_id, receiver_id,
+                    transaction_date, record_count, is_downloaded}
+        """
+        result = self._client.service.GetNewTransactions(
+            login=login,
+            pwd=pwd,
+        )
+        return_code   = result.getNewTransactionsResult
+        xml_str       = result.xmlTransactions or ""
+        error_msg     = result.errorMessage or ""
+
+        if return_code not in DHPO_OK_CODES:
+            raise RuntimeError(
+                f"GetNewTransactions failed (code {return_code}): {error_msg}"
+            )
+        if error_msg:
+            log.warning("GetNewTransactions warning: %s", error_msg)
+
+        return _parse_files_xml(xml_str)
+
+    # ------------------------------------------------------------------
+    # SearchTransactions — date-range search
+    # ------------------------------------------------------------------
+    def search_transactions(
+        self,
+        login: str,
+        pwd: str,
+        direction: int,
+        caller_license: Optional[str],
+        transaction_id: int,
+        date_from: date,
+        date_to: date,
+        transaction_status: int = -1,   # -1 = all; 1 = new only; 2 = downloaded only
+    ) -> List[Dict]:
+        """
+        Returns list of file descriptor dicts matching search criteria.
+        Max 500 records per call per spec.
+        """
+        from_str = date_from.strftime("%d/%m/%Y 00:00:00")
+        to_str   = date_to.strftime("%d/%m/%Y 23:59:59")
+
+        result = self._client.service.SearchTransactions(
+            login=login,
+            pwd=pwd,
+            direction=direction,
+            callerLicense=caller_license,
+            ePartner=None,
+            transactionID=transaction_id,
+            transactionStatus=transaction_status,
+            transactionFileName=None,
+            transactionFromDate=from_str,
+            transactionToDate=to_str,
+            minRecordCount=-1,
+            maxRecordCount=-1,
+        )
+        return_code   = result.searchTransactionsResult
+        xml_str       = result.foundTransactions or ""
+        error_msg     = result.errorMessage or ""
+
+        if return_code not in DHPO_OK_CODES:
+            raise RuntimeError(
+                f"SearchTransactions failed (code {return_code}): {error_msg}"
+            )
+        if error_msg:
+            log.warning("SearchTransactions warning: %s", error_msg)
+
+        return _parse_files_xml(xml_str)
+
+    # ------------------------------------------------------------------
+    # DownloadTransactionFile — fetch actual file bytes
+    # ------------------------------------------------------------------
+    def download_transaction_file(self, login: str, pwd: str, file_id: str) -> bytes:
+        """
+        Downloads the file content for *file_id*.
+        Returns raw bytes (may be XML or ZIP containing XML).
+        """
+        result = self._client.service.DownloadTransactionFile(
+            login=login,
+            pwd=pwd,
+            fileID=file_id,
+        )
+        return_code = result.downloadTransactionFileResult
+        error_msg   = result.errorMessage or ""
+        file_bytes  = result.file  # bytes / bytearray / None
+
+        if return_code not in DHPO_OK_CODES:
+            raise RuntimeError(
+                f"DownloadTransactionFile({file_id}) failed (code {return_code}): {error_msg}"
+            )
+        if error_msg:
+            log.warning("DownloadTransactionFile warning: %s", error_msg)
+
+        if file_bytes is None:
+            raise RuntimeError(f"DownloadTransactionFile({file_id}) returned no data")
+
+        return bytes(file_bytes)
+
+    # ------------------------------------------------------------------
+    # SetTransactionDownloaded — mark file as downloaded
+    # ------------------------------------------------------------------
+    def set_transaction_downloaded(self, login: str, pwd: str, file_id: str) -> None:
+        """
+        Marks *file_id* as downloaded so GetNewTransactions won't return it again.
+        Logs a warning on failure but does not raise (non-critical).
+        """
+        try:
+            result = self._client.service.SetTransactionDownloaded(
+                login=login,
+                pwd=pwd,
+                fileID=file_id,
+            )
+            return_code = result.setTransactionDownloadedResult
+            error_msg   = result.errorMessage or ""
+            if return_code not in DHPO_OK_CODES:
+                log.warning(
+                    "SetTransactionDownloaded(%s) returned code %d: %s",
+                    file_id, return_code, error_msg,
+                )
+        except Exception as exc:
+            log.warning("SetTransactionDownloaded(%s) failed (non-critical): %s", file_id, exc)
+
+
+# ----------------------------------------------------------------------------
+# XML helpers
+# ----------------------------------------------------------------------------
+def _parse_files_xml(xml_str: str) -> List[Dict]:
+    """Parse the <Files><File .../></Files> XML returned by GetNewTransactions /
+    SearchTransactions into a list of plain dicts."""
+    if not xml_str or not xml_str.strip():
+        return []
+
+    from lxml import etree
+    try:
+        root = etree.fromstring(xml_str.encode("utf-8"))
+    except etree.XMLSyntaxError as exc:
+        log.warning("Could not parse DHPO files XML: %s — raw: %.200s", exc, xml_str)
+        return []
+
+    files = []
+    for file_el in root.findall("File"):
+        files.append({
+            "file_id":          file_el.get("FileID", ""),
+            "file_name":        file_el.get("FileName", ""),
+            "sender_id":        file_el.get("SenderID", ""),
+            "receiver_id":      file_el.get("ReceiverID", ""),
+            "transaction_date": file_el.get("TransactionDate", ""),
+            "record_count":     file_el.get("RecordCount", "0"),
+            "is_downloaded":    file_el.get("IsDownloaded", "False").lower() == "true",
+        })
+    return files
+
+
+def _extract_xml_from_bytes(raw: bytes, filename: str) -> List[Dict[str, Any]]:
+    """
+    Extract XML content(s) from raw bytes.
+    *raw* may be:
+      - A single XML file → returns [{xml: str, filename: str}]
+      - A ZIP archive containing one or more XML files → one entry per member
+    """
+    # ZIP detection
+    if raw[:4] == b"PK\x03\x04":
+        results = []
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                for member in zf.namelist():
+                    member_bytes = zf.read(member)
+                    try:
+                        xml_str = member_bytes.decode("utf-8", errors="replace")
+                        results.append({"xml": xml_str, "filename": member})
+                    except Exception as exc:
+                        log.warning("Could not decode zip member %s: %s", member, exc)
+        except zipfile.BadZipFile as exc:
+            log.warning("File %s looked like ZIP but isn't: %s", filename, exc)
+        return results
+
+    # Plain text / XML
+    try:
+        xml_str = raw.decode("utf-8", errors="replace")
+    except Exception as exc:
+        log.warning("Could not decode %s as UTF-8: %s", filename, exc)
+        return []
+    return [{"xml": xml_str, "filename": filename}]
+
+
+def _parse_tx_date(date_str: str) -> Optional[date]:
+    """Parse 'dd/MM/yyyy HH:mm:ss' → date, or return None."""
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(date_str.strip(), fmt).date()
+        except (ValueError, AttributeError):
+            continue
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Main service
+# ----------------------------------------------------------------------------
 class DHASyncService:
     """
     Can be used either:
       - bound to an existing request-scoped Session: `DHASyncService(session=db)`
-      - standalone (CLI/cron): `DHASyncService(db_url=..., eclaimlink_api_base=...)`
+      - standalone (CLI/cron): `DHASyncService(db_url=...)`
     """
 
     def __init__(
         self,
         db_url: Optional[str] = None,
-        eclaimlink_api_base: str = "https://eclaimlink.ae/api/v1",
         session: Optional[Session] = None,
     ):
         if session is not None:
@@ -67,8 +319,6 @@ class DHASyncService:
             self.db = self._SessionLocal()
             self._owns_session = True
 
-        self.eclaimlink_api_base = eclaimlink_api_base
-
     def close(self) -> None:
         if self._owns_session:
             self.db.close()
@@ -80,7 +330,7 @@ class DHASyncService:
         self.close()
 
     # ------------------------------------------------------------------
-    # Orchestration
+    # Public orchestration entry point
     # ------------------------------------------------------------------
     def run_sync_pipeline(self, facility_id: int, date_from: date, date_to: date) -> FetchLog:
         facility = self.db.get(Facility, facility_id)
@@ -106,10 +356,14 @@ class DHASyncService:
             for xml_type in XML_TYPES:
                 try:
                     payloads = self._fetch_transactions(facility, xml_type, date_from, date_to)
-                except Exception as e:
-                    log.error("eClaimLink fetch failed for %s/%s: %s", facility.facility_code, xml_type, e, exc_info=True)
+                except Exception as exc:
+                    log.error(
+                        "eClaimLink fetch failed for %s / %s: %s",
+                        facility.facility_code, xml_type, exc,
+                        exc_info=True,
+                    )
                     http_errors += 1
-                    error_detail[xml_type] = str(e)
+                    error_detail[xml_type] = str(exc)
                     continue
 
                 for payload in payloads:
@@ -127,11 +381,11 @@ class DHASyncService:
 
             self.db.commit()
 
-            # Parse everything pending (newly fetched + any manual uploads)
+            # Parse everything pending (newly fetched + any manually uploaded)
             parser = DHPOXmlParser(self.db)
             summary = parser.run_pending(facility_id=facility_id)
 
-            fetch_log.completed_at = datetime.utcnow()
+            fetch_log.completed_at = datetime.now(timezone.utc)
             fetch_log.records_fetched = records_fetched
             fetch_log.records_parsed = summary.records_parsed_total
             fetch_log.records_failed = summary.quarantined_records
@@ -149,42 +403,117 @@ class DHASyncService:
             self.db.commit()
             return fetch_log
 
-        except Exception as e:
+        except Exception as exc:
             self.db.rollback()
-            fetch_log.completed_at = datetime.utcnow()
+            fetch_log.completed_at = datetime.now(timezone.utc)
             fetch_log.status = "failed"
-            fetch_log.error_detail = {"error": str(e)}
+            fetch_log.error_detail = {"error": str(exc)}
             self.db.commit()
             raise
 
     # ------------------------------------------------------------------
-    # eClaimLink (DHPO) transport — implement against your WSDL
+    # Per xml_type fetch via DHPO SOAP
     # ------------------------------------------------------------------
     def _fetch_transactions(
-        self, facility: Facility, xml_type: str, date_from: date, date_to: date
+        self,
+        facility: Facility,
+        xml_type: str,
+        date_from: date,
+        date_to: date,
     ) -> List[Dict[str, Any]]:
         """
+        Uses SearchTransactions + DownloadTransactionFile + SetTransactionDownloaded
+        per the DHPO WebService Specification V3 (July 2017).
+
         Returns a list of {"xml": str, "filename": str, "submission_date": date}.
-
-        TODO: Replace with a real call to the DHPO SOAP service, e.g.:
-
-            from zeep import Client
-            client = Client(f"{self.eclaimlink_api_base}/ValidateTransactions.asmx?WSDL")
-            result = client.service.SearchTransactions(
-                login=facility.eclaimlink_username,
-                pwd=facility.credential_key,
-                fromDate=date_from.strftime("%d/%m/%Y"),
-                toDate=date_to.strftime("%d/%m/%Y"),
-                transactionType="ClaimSubmission" if xml_type == "ClaimSubmission" else "RemittanceAdvice",
-                facilityID=facility.dhpo_provider_id,
-            )
-            # ... then DownloadTransaction for each file ID, returning raw XML bytes.
-
-        Until implemented, no live records are fetched — the pipeline still
-        parses anything already staged (e.g. via manual upload).
         """
-        log.info(
-            "eClaimLink live fetch not configured for facility=%s xml_type=%s (%s..%s); skipping.",
-            facility.facility_code, xml_type, date_from, date_to,
+        login = facility.eclaimlink_username
+        pwd   = facility.credential_key
+        caller_license = facility.dhpo_provider_id  # may be None
+
+        if not login or not pwd:
+            log.warning(
+                "Facility %s has no eClaimLink credentials — skipping %s fetch.",
+                facility.facility_code, xml_type,
+            )
+            return []
+
+        # Map xml_type → DHPO transactionID + direction
+        if xml_type == "ClaimSubmission":
+            tx_id     = TX_CLAIM_SUBMISSION
+            direction = DIRECTION_SENT       # provider sent claims to payer
+        elif xml_type == "RemittanceAdvice":
+            tx_id     = TX_REMITTANCE_ADVICE
+            direction = DIRECTION_RECEIVED   # provider received remittance from payer
+        else:
+            log.warning("Unknown xml_type %s — skipping.", xml_type)
+            return []
+
+        # Choose WSDL: use archive if date_from is older than 24 months
+        months_ago = (date.today().year - date_from.year) * 12 + (
+            date.today().month - date_from.month
         )
-        return []
+        if xml_type == "ClaimSubmission" and months_ago >= 24:
+            wsdl = DHPO_ARCHIVE_WSDL
+            log.info("Using ARCHIVE endpoint for %s (%.0f months ago)", xml_type, months_ago)
+        else:
+            wsdl = DHPO_LIVE_WSDL
+
+        client = DHPOSoapClient(wsdl)
+
+        log.info(
+            "SearchTransactions: facility=%s xml_type=%s from=%s to=%s direction=%d tx_id=%d",
+            facility.facility_code, xml_type, date_from, date_to, direction, tx_id,
+        )
+
+        file_descriptors = client.search_transactions(
+            login=login,
+            pwd=pwd,
+            direction=direction,
+            caller_license=caller_license,
+            transaction_id=tx_id,
+            date_from=date_from,
+            date_to=date_to,
+            transaction_status=-1,   # all (new + already downloaded) — let caller decide
+        )
+
+        log.info(
+            "SearchTransactions returned %d file(s) for %s / %s",
+            len(file_descriptors), facility.facility_code, xml_type,
+        )
+
+        payloads: List[Dict[str, Any]] = []
+
+        for desc in file_descriptors:
+            file_id   = desc["file_id"]
+            file_name = desc["file_name"] or f"file_{file_id}.xml"
+            tx_date   = _parse_tx_date(desc.get("transaction_date", ""))
+
+            log.info(
+                "Downloading FileID=%s FileName=%s RecordCount=%s",
+                file_id, file_name, desc.get("record_count"),
+            )
+
+            try:
+                raw_bytes = client.download_transaction_file(login, pwd, file_id)
+            except Exception as exc:
+                log.error("DownloadTransactionFile(%s) failed: %s", file_id, exc)
+                continue
+
+            # Decompress ZIP or decode plain XML
+            extracted = _extract_xml_from_bytes(raw_bytes, file_name)
+            if not extracted:
+                log.warning("No XML extracted from FileID=%s FileName=%s", file_id, file_name)
+                continue
+
+            for item in extracted:
+                payloads.append({
+                    "xml":             item["xml"],
+                    "filename":        item["filename"],
+                    "submission_date": tx_date or date_to,
+                })
+
+            # Mark as downloaded so GetNewTransactions won't return it again
+            client.set_transaction_downloaded(login, pwd, file_id)
+
+        return payloads
