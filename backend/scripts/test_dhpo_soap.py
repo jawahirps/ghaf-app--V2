@@ -74,9 +74,14 @@ def test_get_new(client, login, pwd):
     print("\n[1] GetNewTransactions ...")
     try:
         result = client.service.GetNewTransactions(login=login, pwd=pwd)
-        code    = result.getNewTransactionsResult
-        xml_str = result.xmlTransactions or ""
-        err     = result.errorMessage or ""
+        code    = (result.getNewTransactionsResult
+                   if hasattr(result, "getNewTransactionsResult")
+                   else getattr(result, "GetNewTransactionsResult",
+                        getattr(result, "returnCode", -99)))
+        xml_str = getattr(result, "xmlTransactions",
+                   getattr(result, "XmlTransactions", "")) or ""
+        err     = getattr(result, "errorMessage",
+                   getattr(result, "ErrorMessage", "")) or ""
         print(f"  Return code : {code}")
         print(f"  Error msg   : {err or '(none)'}")
         if xml_str:
@@ -94,7 +99,7 @@ def test_get_new(client, login, pwd):
 
 
 def test_search(client, login, pwd, direction, tx_id, label,
-                date_from, date_to, caller_license, do_download):
+                date_from, date_to, caller_license, do_download, tx_status=1):
     print(f"\n[SearchTransactions] {label}  direction={direction}  tx_id={tx_id}")
     from_str = date_from.strftime("%d/%m/%Y 00:00:00")
     to_str   = date_to.strftime("%d/%m/%Y 23:59:59")
@@ -108,16 +113,20 @@ def test_search(client, login, pwd, direction, tx_id, label,
             callerLicense=caller_license,
             ePartner=None,
             transactionID=tx_id,
-            transactionStatus=-1,
+            TransactionStatus=tx_status,
             transactionFileName=None,
             transactionFromDate=from_str,
             transactionToDate=to_str,
             minRecordCount=-1,
             maxRecordCount=-1,
         )
-        code    = result.searchTransactionsResult
-        xml_str = result.foundTransactions or ""
-        err     = result.errorMessage or ""
+        code    = (result.searchTransactionsResult
+                   if hasattr(result, "searchTransactionsResult")
+                   else getattr(result, "SearchTransactionsResult", -99))
+        xml_str = getattr(result, "foundTransactions",
+                   getattr(result, "FoundTransactions", "")) or ""
+        err     = getattr(result, "errorMessage",
+                   getattr(result, "ErrorMessage", "")) or ""
         print(f"  Return code : {code}  ({'OK' if code in DHPO_OK_CODES else 'ERROR'})")
         print(f"  Error msg   : {err or '(none)'}")
 
@@ -139,11 +148,17 @@ def test_search(client, login, pwd, direction, tx_id, label,
             print(f"\n  [Download] FileID={fid} ...")
             try:
                 dl = client.service.DownloadTransactionFile(
-                    login=login, pwd=pwd, fileID=fid
+                    login=login, pwd=pwd, fileId=fid
                 )
-                dl_code = dl.downloadTransactionFileResult
-                dl_err  = dl.errorMessage or ""
-                raw     = dl.file
+                dl_code = (dl.downloadTransactionFileResult
+                           if hasattr(dl, "downloadTransactionFileResult")
+                           else getattr(dl, "DownloadTransactionFileResult", 0))
+                dl_err  = getattr(dl, "errorMessage",
+                           getattr(dl, "ErrorMessage", "")) or ""
+                raw     = getattr(dl, "file",
+                           getattr(dl, "File",
+                            getattr(dl, "fileContent",
+                             getattr(dl, "FileContent", None))))
                 print(f"    Return code : {dl_code}")
                 print(f"    Error msg   : {dl_err or '(none)'}")
                 if raw:
@@ -184,10 +199,18 @@ def main():
 
     test_search(client, args.login, args.pwd,
                 direction=1, tx_id=TX_CLAIM_SUBMISSION,
-                label="ClaimSubmission (sent)",
+                label="ClaimSubmission NEW (status=1)",
                 date_from=date_from, date_to=date_to,
                 caller_license=args.license,
                 do_download=args.download)
+
+    test_search(client, args.login, args.pwd,
+                direction=1, tx_id=TX_CLAIM_SUBMISSION,
+                label="ClaimSubmission DOWNLOADED (status=2)",
+                date_from=date_from, date_to=date_to,
+                caller_license=args.license,
+                do_download=args.download,
+                tx_status=2)
 
     test_search(client, args.login, args.pwd,
                 direction=2, tx_id=TX_REMITTANCE_ADVICE,

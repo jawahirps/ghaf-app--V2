@@ -12,3 +12,4 @@ lxml==5.3.0
 PyJWT==2.10.1
 python-multipart==0.0.20
 openpyxl==3.1.5
+zeep==4.2.1

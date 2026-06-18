@@ -131,7 +131,7 @@ class DHPOSoapClient:
         transaction_id: int,
         date_from: date,
         date_to: date,
-        transaction_status: int = -1,   # -1 = all; 1 = new only; 2 = downloaded only
+        transaction_status: int = 1,    # 1 = new (undownloaded) only; 2 = downloaded only
     ) -> List[Dict]:
         """
         Returns list of file descriptor dicts matching search criteria.
@@ -147,16 +147,20 @@ class DHPOSoapClient:
             callerLicense=caller_license,
             ePartner=None,
             transactionID=transaction_id,
-            transactionStatus=transaction_status,
+            TransactionStatus=transaction_status,
             transactionFileName=None,
             transactionFromDate=from_str,
             transactionToDate=to_str,
             minRecordCount=-1,
             maxRecordCount=-1,
         )
-        return_code   = result.searchTransactionsResult
-        xml_str       = result.foundTransactions or ""
-        error_msg     = result.errorMessage or ""
+        return_code   = (result.searchTransactionsResult
+                         if hasattr(result, "searchTransactionsResult")
+                         else result.SearchTransactionsResult)
+        xml_str       = getattr(result, "foundTransactions",
+                         getattr(result, "FoundTransactions", "")) or ""
+        error_msg     = getattr(result, "errorMessage",
+                         getattr(result, "ErrorMessage", "")) or ""
 
         if return_code not in DHPO_OK_CODES:
             raise RuntimeError(
@@ -178,11 +182,17 @@ class DHPOSoapClient:
         result = self._client.service.DownloadTransactionFile(
             login=login,
             pwd=pwd,
-            fileID=file_id,
+            fileId=file_id,
         )
-        return_code = result.downloadTransactionFileResult
-        error_msg   = result.errorMessage or ""
-        file_bytes  = result.file  # bytes / bytearray / None
+        return_code = (result.downloadTransactionFileResult
+                       if hasattr(result, "downloadTransactionFileResult")
+                       else getattr(result, "DownloadTransactionFileResult", 0))
+        error_msg   = getattr(result, "errorMessage",
+                       getattr(result, "ErrorMessage", "")) or ""
+        file_bytes  = getattr(result, "file",
+                       getattr(result, "File",
+                        getattr(result, "fileContent",
+                         getattr(result, "FileContent", None))))
 
         if return_code not in DHPO_OK_CODES:
             raise RuntimeError(
@@ -208,7 +218,7 @@ class DHPOSoapClient:
             result = self._client.service.SetTransactionDownloaded(
                 login=login,
                 pwd=pwd,
-                fileID=file_id,
+                fileId=file_id,
             )
             return_code = result.setTransactionDownloadedResult
             error_msg   = result.errorMessage or ""
@@ -466,19 +476,36 @@ class DHASyncService:
             facility.facility_code, xml_type, date_from, date_to, direction, tx_id,
         )
 
-        file_descriptors = client.search_transactions(
-            login=login,
-            pwd=pwd,
-            direction=direction,
-            caller_license=caller_license,
-            transaction_id=tx_id,
-            date_from=date_from,
-            date_to=date_to,
-            transaction_status=-1,   # all (new + already downloaded) — let caller decide
-        )
+        # Fetch both new (status=1) and already-downloaded (status=2) files.
+        # status=2 captures files previously downloaded via the eClaimLink portal
+        # that were never pulled through this API.
+        file_descriptors: List[Dict] = []
+        seen_ids: set = set()
+        for tx_status in (1, 2):
+            try:
+                batch = client.search_transactions(
+                    login=login,
+                    pwd=pwd,
+                    direction=direction,
+                    caller_license=caller_license,
+                    transaction_id=tx_id,
+                    date_from=date_from,
+                    date_to=date_to,
+                    transaction_status=tx_status,
+                )
+                for d in batch:
+                    if d["file_id"] not in seen_ids:
+                        seen_ids.add(d["file_id"])
+                        file_descriptors.append(d)
+                log.info(
+                    "SearchTransactions status=%d returned %d file(s) for %s / %s",
+                    tx_status, len(batch), facility.facility_code, xml_type,
+                )
+            except Exception as exc:
+                log.warning("SearchTransactions status=%d failed: %s", tx_status, exc)
 
         log.info(
-            "SearchTransactions returned %d file(s) for %s / %s",
+            "SearchTransactions total %d unique file(s) for %s / %s",
             len(file_descriptors), facility.facility_code, xml_type,
         )
 
