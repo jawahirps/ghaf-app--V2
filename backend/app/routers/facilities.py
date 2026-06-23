@@ -25,13 +25,27 @@ class FacilityOut(BaseModel):
     id: int
     facility_code: str
     facility_name: str
-    license_id: str
-    eclaimlink_username: str
-    credential_key: str
+    license_id: Optional[str] = None
+    eclaimlink_username: Optional[str] = None
     dhpo_provider_id: Optional[str] = None
     is_active: bool
+    has_credential: bool = False
 
     model_config = {"from_attributes": True}
+
+    @classmethod
+    def from_orm_facility(cls, fac) -> "FacilityOut":
+        data = {
+            "id": fac.id,
+            "facility_code": fac.facility_code,
+            "facility_name": fac.facility_name,
+            "license_id": fac.license_id,
+            "eclaimlink_username": fac.eclaimlink_username,
+            "dhpo_provider_id": fac.dhpo_provider_id,
+            "is_active": fac.is_active,
+            "has_credential": bool(fac.credential_key),
+        }
+        return cls(**data)
 
 
 class FacilityUpdate(BaseModel):
@@ -57,7 +71,8 @@ def list_facilities(
     current_user: User = Depends(get_current_user),
 ):
     _require_admin(current_user)
-    return db.query(Facility).order_by(Facility.facility_name).all()
+    facilities = db.query(Facility).order_by(Facility.facility_name).all()
+    return [FacilityOut.from_orm_facility(f) for f in facilities]
 
 
 @router.get("/{facility_id}", response_model=FacilityOut)
@@ -70,7 +85,7 @@ def get_facility(
     fac = db.get(Facility, facility_id)
     if not fac:
         raise HTTPException(status_code=404, detail="Facility not found.")
-    return fac
+    return FacilityOut.from_orm_facility(fac)
 
 
 @router.put("/{facility_id}", response_model=FacilityOut)
@@ -91,4 +106,4 @@ def update_facility(
 
     db.commit()
     db.refresh(fac)
-    return fac
+    return FacilityOut.from_orm_facility(fac)

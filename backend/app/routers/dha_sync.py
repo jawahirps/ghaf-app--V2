@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import FetchLog, RawXmlStore, User
+from ..models import Facility, FetchLog, RawXmlStore, User
 from ..schemas import DhaFetchRequest, DhaSyncTriggerResponse, DhaUploadResponse, FetchLogOut, RawXmlStoreOut
 from ..security import get_current_user, require_roles
 from ..services.dhpo_parser import DHPOXmlParser
@@ -140,7 +140,8 @@ def fetch_from_eclaimlink(
     """
     facility_scope = payload.facility_id or current_user.facility_id
     if facility_scope is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="facility_id is required")
+        # Admin with no facility_id — default to Apollo Clinics (ID 13)
+        facility_scope = 13
 
     if payload.date_to < payload.date_from:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="date_to must be on or after date_from")
@@ -159,10 +160,32 @@ def fetch_from_eclaimlink(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"DHA fetch failed: {e}")
 
 
+@router.post("/reparse")
+def reparse_all(
+    facility_id: Optional[int] = None,
+    xml_type: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "billing_manager")),
+):
+    """Reset parsed/quarantined records back to pending so they are re-parsed on next trigger."""
+    from ..models import RawXmlStore as RXS
+    query = db.query(RXS).filter(RXS.parse_status.in_(["parsed", "quarantined"]))
+    facility_scope = facility_id or current_user.facility_id
+    if facility_scope is not None:
+        query = query.filter(RXS.facility_id == facility_scope)
+    if xml_type:
+        query = query.filter(RXS.xml_type == xml_type)
+    count = query.update({"parse_status": "pending", "records_parsed": None, "parse_error": None},
+                         synchronize_session=False)
+    db.commit()
+    return {"reset": count, "message": f"Reset {count} records to pending. Run Trigger DHA XML Sync to re-parse."}
+
+
 @router.get("/raw-xml", response_model=List[RawXmlStoreOut])
 def list_raw_xml(
     facility_id: Optional[int] = None,
     parse_status: Optional[str] = None,
+    xml_type: Optional[str] = None,
     limit: int = 100,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -174,8 +197,26 @@ def list_raw_xml(
         query = query.filter(RawXmlStore.facility_id == facility_scope)
     if parse_status:
         query = query.filter(RawXmlStore.parse_status == parse_status)
+    if xml_type:
+        query = query.filter(RawXmlStore.xml_type == xml_type)
 
     return query.order_by(RawXmlStore.fetched_at.desc()).limit(min(limit, 500)).all()
+
+
+@router.get("/raw-xml/{record_id}/peek")
+def peek_raw_xml(
+    record_id: int,
+    chars: int = 800,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Return the first N characters of a staged XML record — for debugging parser issues."""
+    record = db.get(RawXmlStore, record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return {"id": record.id, "xml_type": record.xml_type,
+            "source_filename": record.source_filename,
+            "preview": (record.xml_content or "")[:chars]}
 
 
 @router.get("/fetch-logs", response_model=List[FetchLogOut])

@@ -31,9 +31,10 @@ function FacilityRow({ facility, onSaved }) {
   });
 
   const isLive =
+    facility.has_credential &&
     !isPlaceholder(facility.eclaimlink_username) &&
-    !isPlaceholder(facility.credential_key) &&
-    !isPlaceholder(facility.license_id);
+    !isPlaceholder(facility.license_id) &&
+    facility.is_active;
 
   const handleChange = (e) => {
     const { name, value, type, checked } = e.target;
@@ -184,9 +185,10 @@ export default function FacilitySettings() {
 
   const liveCount = facilities.filter(
     (f) =>
+      f.has_credential &&
       !isPlaceholder(f.eclaimlink_username) &&
-      !isPlaceholder(f.credential_key) &&
-      !isPlaceholder(f.license_id)
+      !isPlaceholder(f.license_id) &&
+      f.is_active
   ).length;
 
   return (

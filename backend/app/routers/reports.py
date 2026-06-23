@@ -38,11 +38,248 @@ from openpyxl.utils import get_column_letter
 from ..database import get_db
 from ..models import (
     Claim, ClaimActivity, Facility, Remittance,
-    RemittanceActivityDetail, ReportJob,
+    RemittanceActivityDetail, ReportJob, RawXmlStore,
 )
 from ..security import get_current_user
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
+
+# ---------------------------------------------------------------------------
+# DHA Denial Code lookup  (Code → description / category / type)
+# Source: "Denial Codes 29Oct2024.xlsx"
+# category = code family prefix (AUTH, CLAI, MNEC, …)
+# type     = Technical | Medical
+# ---------------------------------------------------------------------------
+DENIAL_CODE_MAP: dict[str, dict] = {
+    "AUTH-001": {"description": "Prior approval is required and was not obtained", "category": "AUTH", "type": "Technical"},
+    "AUTH-002": {"description": "Services performed are inconsistent with authorized or approved services", "category": "AUTH", "type": "Technical"},
+    "AUTH-003": {"description": "PriorAuthorizationNumber is invalid", "category": "AUTH", "type": "Technical"},
+    "AUTH-004": {"description": "Service(s) is (are) performed outside authorization validity date", "category": "AUTH", "type": "Technical"},
+    "AUTH-005": {"description": "Claim information is inconsistent with pre-certified/authorized services", "category": "AUTH", "type": "Technical"},
+    "AUTH-006": {"description": "Alert drug - drug interaction or drug is contra-indicated", "category": "AUTH", "type": "Technical"},
+    "AUTH-007": {"description": "Drug duplicate therapy", "category": "AUTH", "type": "Technical"},
+    "AUTH-008": {"description": "Inappropriate drug dose", "category": "AUTH", "type": "Technical"},
+    "AUTH-009": {"description": "Prescription out of date", "category": "AUTH", "type": "Technical"},
+    "AUTH-010": {"description": "Authorization request overlaps or is within the period of another paid claim or approved authorization", "category": "AUTH", "type": "Technical"},
+    "AUTH-011": {"description": "Waiting period on pre-existing / specific conditions", "category": "AUTH", "type": "Technical"},
+    "AUTH-012": {"description": "Request for information", "category": "AUTH", "type": "Technical"},
+    "AUTH-013": {"description": "Missing eRx Reference number", "category": "AUTH", "type": "Technical"},
+    "AUTH-014": {"description": "Medication has been added to a prior request that is not in line with Pharmacist Edit Restrictions", "category": "AUTH", "type": "Technical"},
+    "BENX-001": {"description": "Service / Medication is above AED threshold", "category": "BENX", "type": "Technical"},
+    "BENX-002": {"description": "Benefit maximum for this time period or occurrence has been reached", "category": "BENX", "type": "Technical"},
+    "BENX-005": {"description": "Annual limit/sublimit amount exceeded", "category": "BENX", "type": "Technical"},
+    "BSMA-001": {"description": "Member not covered under Basmah", "category": "BSMA", "type": "Technical"},
+    "BSMA-002": {"description": "Claims is not eligible under Basmah Fund", "category": "BSMA", "type": "Technical"},
+    "BSMA-003": {"description": "Prior approval is required but not taken (Basmah)", "category": "BSMA", "type": "Technical"},
+    "CLAI-007": {"description": "Claim is a work-related injury/illness and thus the liability of the employer", "category": "CLAI", "type": "Technical"},
+    "CLAI-008": {"description": "Claim overlaps inpatient stay. Resubmit only those services rendered outside the inpatient stay", "category": "CLAI", "type": "Technical"},
+    "CLAI-009": {"description": "Date of birth follows the date of service", "category": "CLAI", "type": "Technical"},
+    "CLAI-010": {"description": "Date of death precedes the date of service", "category": "CLAI", "type": "Technical"},
+    "CLAI-011": {"description": "Inpatient admission spans multiple rate periods. Resubmit separate claims", "category": "CLAI", "type": "Technical"},
+    "CLAI-012": {"description": "Submission not compliant with contractual agreement between provider & payer", "category": "CLAI", "type": "Technical"},
+    "CLAI-013": {"description": "Missing an Observation (Dental Tooth #)", "category": "CLAI", "type": "Technical"},
+    "CLAI-014": {"description": "Claim not compliant with Resubmission type (used only for resubmissions)", "category": "CLAI", "type": "Technical"},
+    "CLAI-017": {"description": "Services not available on direct billing", "category": "CLAI", "type": "Technical"},
+    "CLAI-018": {"description": "Claims Recalled By Provider", "category": "CLAI", "type": "Technical"},
+    "CLAI-019": {"description": "Incorrect IR-DRG code", "category": "CLAI", "type": "Technical"},
+    "CLAI-020": {"description": "Missing IR-DRG code", "category": "CLAI", "type": "Technical"},
+    "CLAI-021": {"description": "Incorrect DRG payment parameter", "category": "CLAI", "type": "Technical"},
+    "CLAI-022": {"description": "Missing DRG payment parameter", "category": "CLAI", "type": "Technical"},
+    "CLAI-023": {"description": "Submission not compliant with contractual agreement between non-network physician & payer", "category": "CLAI", "type": "Technical"},
+    "CODE-001": {"description": "Missing, incomplete or invalid principal diagnosis", "category": "CODE", "type": "Technical"},
+    "CODE-002": {"description": "Missing, incomplete or invalid service code", "category": "CODE", "type": "Technical"},
+    "CODE-006": {"description": "Diagnosis is inconsistent with the procedure", "category": "CODE", "type": "Medical"},
+    "CODE-010": {"description": "Activity/diagnosis inconsistent with clinician specialty", "category": "CODE", "type": "Technical"},
+    "CODE-012": {"description": "Encounter type inconsistent with service(s) / diagnosis", "category": "CODE", "type": "Medical"},
+    "CODE-013": {"description": "Invalid principal diagnosis", "category": "CODE", "type": "Medical"},
+    "CODE-014": {"description": "Activity/diagnosis is inconsistent with the patient's age/gender", "category": "CODE", "type": "Medical"},
+    "CODE-015": {"description": "Activity/diagnosis is inconsistent with the provider type", "category": "CODE", "type": "Technical"},
+    "CODE-016": {"description": "Activity/diagnosis inconsistent with Service", "category": "CODE", "type": "Medical"},
+    "COPY-001": {"description": "Deductible/co-pay not collected from member", "category": "COPY", "type": "Technical"},
+    "COPY-002": {"description": "Incorrect Patient Share", "category": "COPY", "type": "Technical"},
+    "COPY-003": {"description": "Missing Patient Share", "category": "COPY", "type": "Technical"},
+    "DRG-001": {"description": "Incorrect DRG code", "category": "DRG", "type": "Technical"},
+    "DRG-002": {"description": "Missing DRG code", "category": "DRG", "type": "Technical"},
+    "DRG-003": {"description": "Incorrect Billing Regime", "category": "DRG", "type": "Technical"},
+    "DRG-004": {"description": "Missing Activities", "category": "DRG", "type": "Technical"},
+    "DRG-005": {"description": "Missing Observation (ActivityCost and/or File Attachment)", "category": "DRG", "type": "Technical"},
+    "DUPL-001": {"description": "Claim is a duplicate based on service codes and dates", "category": "DUPL", "type": "Technical"},
+    "DUPL-002": {"description": "Payment already made for same/similar service within set time frame", "category": "DUPL", "type": "Technical"},
+    "ELIG-001": {"description": "Patient is not a covered member", "category": "ELIG", "type": "Technical"},
+    "ELIG-005": {"description": "Services performed after the last date of coverage", "category": "ELIG", "type": "Technical"},
+    "ELIG-006": {"description": "Services performed prior to the effective date of coverage", "category": "ELIG", "type": "Technical"},
+    "ELIG-007": {"description": "Services performed by a non-network provider", "category": "ELIG", "type": "Technical"},
+    "ELIG-008": {"description": "Services performed by a non-network physician", "category": "ELIG", "type": "Technical"},
+    "MNEC-003": {"description": "Service is not clinically indicated based on good clinical practice", "category": "MNEC", "type": "Medical"},
+    "MNEC-004": {"description": "Service is not clinically indicated based on good clinical practice, without additional supporting diagnoses/activities", "category": "MNEC", "type": "Medical"},
+    "MNEC-005": {"description": "Service/supply may be appropriate, but too frequent", "category": "MNEC", "type": "Medical"},
+    "MNEC-006": {"description": "Alternative service should have been utilized", "category": "MNEC", "type": "Medical"},
+    "MNEC-007": {"description": "Service is not clinically indicated based on good clinical practice, without additional supporting documentation", "category": "MNEC", "type": "Medical"},
+    "NCOV-001": {"description": "Diagnosis(es) is (are) not covered", "category": "NCOV", "type": "Medical"},
+    "NCOV-002": {"description": "Pre-existing conditions are not covered", "category": "NCOV", "type": "Technical"},
+    "NCOV-003": {"description": "Service(s) is (are) not covered", "category": "NCOV", "type": "Medical"},
+    "NCOV-009": {"description": "Dental treatments are not covered", "category": "NCOV", "type": "Medical"},
+    "NCOV-010": {"description": "Elective procedure is not covered", "category": "NCOV", "type": "Medical"},
+    "NCOV-012": {"description": "Eye exams and treatments are not covered", "category": "NCOV", "type": "Medical"},
+    "NCOV-014": {"description": "Hearing services are not covered", "category": "NCOV", "type": "Medical"},
+    "NCOV-018": {"description": "Immunizations are not covered", "category": "NCOV", "type": "Technical"},
+    "NCOV-019": {"description": "Preventative care is not covered", "category": "NCOV", "type": "Technical"},
+    "NCOV-020": {"description": "Services resulting from attempted suicide or self-infliction are not covered", "category": "NCOV", "type": "Technical"},
+    "NCOV-021": {"description": "Vaccinations are not covered", "category": "NCOV", "type": "Medical"},
+    "NCOV-024": {"description": "Chronic Condition Service(s) is (are) not covered", "category": "NCOV", "type": "Medical"},
+    "NCOV-025": {"description": "Service(s) is (are) not performed (used after audit)", "category": "NCOV", "type": "Technical"},
+    "NCOV-027": {"description": "Non Coverage of certain medication as per policy", "category": "NCOV", "type": "Technical"},
+    "PRCE-001": {"description": "Calculation discrepancy", "category": "PRCE", "type": "Technical"},
+    "PRCE-002": {"description": "Payment is included in the allowance for another service", "category": "PRCE", "type": "Technical"},
+    "PRCE-003": {"description": "Recovery of Payment", "category": "PRCE", "type": "Technical"},
+    "PRCE-006": {"description": "Consultation within free follow up period", "category": "PRCE", "type": "Technical"},
+    "PRCE-007": {"description": "Service has no contract price", "category": "PRCE", "type": "Technical"},
+    "PRCE-008": {"description": "Multiple procedure payment rules incorrectly applied", "category": "PRCE", "type": "Technical"},
+    "PRCE-009": {"description": "Charges inconsistent with clinician specialty", "category": "PRCE", "type": "Technical"},
+    "PRCE-010": {"description": "Use bundled code", "category": "PRCE", "type": "Technical"},
+    "PRCE-011": {"description": "Discount discrepancy", "category": "PRCE", "type": "Technical"},
+    "PRCE-012": {"description": "Recovery of Payment – DHIC Authorized", "category": "PRCE", "type": "Technical"},
+    "SURC-001": {"description": "Severe drug - drug interaction", "category": "SURC", "type": "Medical"},
+    "SURC-002": {"description": "Severe drug - age contraindication", "category": "SURC", "type": "Medical"},
+    "SURC-003": {"description": "Severe drug - gender contraindication", "category": "SURC", "type": "Medical"},
+    "SURC-004": {"description": "Severe drug - diaganosis contraindication", "category": "SURC", "type": "Medical"},
+    "SURC-005": {"description": "Severe procedure/service - diagnosis contraindication", "category": "SURC", "type": "Medical"},
+    "SURC-006": {"description": "Severe procedure/service - drug contraindication", "category": "SURC", "type": "Medical"},
+    "SURC-007": {"description": "Severe procedure/service - procedure contraindication", "category": "SURC", "type": "Medical"},
+    "SURC-008": {"description": "Serious safety issue with drug dose", "category": "SURC", "type": "Medical"},
+    "TIME-001": {"description": "Time limit for submission has expired", "category": "TIME", "type": "Technical"},
+    "TIME-002": {"description": "Requested additional information was not received or was not received within time limit", "category": "TIME", "type": "Technical"},
+    "TIME-003": {"description": "Appeal procedures not followed or time limits not met", "category": "TIME", "type": "Technical"},
+    "WRNG-001": {"description": "Wrong submission, receiver is not responsible for the payer within this transaction submission.", "category": "WRNG", "type": "Technical"},
+}
+
+
+def _lookup_denial(code: Optional[str]) -> tuple[str, str, str]:
+    """Return (description, category, type) for a denial code, or ('','','')."""
+    if not code:
+        return "", "", ""
+    entry = DENIAL_CODE_MAP.get(code.strip(), {})
+    return entry.get("description", ""), entry.get("category", ""), entry.get("type", "")
+
+
+# ---------------------------------------------------------------------------
+# Clinician lookup  (eClaimLink ID → Professional Name)
+# Loaded once at import time from data/clinicians.xlsx (both DHA_HRD + MOH sheets)
+# ---------------------------------------------------------------------------
+import os as _os
+import openpyxl as _openpyxl
+
+def _load_clinician_map() -> dict[str, str]:
+    data_path = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+        "..", "data", "clinicians.xlsx"
+    )
+    data_path = _os.path.normpath(data_path)
+    cmap: dict[str, str] = {}
+    if not _os.path.exists(data_path):
+        return cmap
+    try:
+        wb = _openpyxl.load_workbook(data_path, read_only=True, data_only=True)
+        for sheet in wb.sheetnames:
+            ws = wb[sheet]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row and row[0] and row[1]:
+                    cmap[str(row[0]).strip()] = str(row[1]).strip()
+        wb.close()
+    except Exception:
+        pass
+    return cmap
+
+_CLINICIAN_MAP: dict[str, str] = _load_clinician_map()
+
+
+def _clinician_name(cid: Optional[str]) -> str:
+    if not cid or cid.strip().upper() == "UNKNOWN":
+        return ""
+    return _CLINICIAN_MAP.get(cid.strip(), cid.strip())
+
+
+# ---------------------------------------------------------------------------
+# Payer / Receiver lookup
+# Sources:
+#   data/payers.xlsx   — standard eClaimLink codes (INS001-INS137, TPA001-TPA036, DHA…)
+#   data/self_paid.xlsx — self-paid employer codes (SF/SP) with their TPA
+#
+# Logic:
+#   Receiver ID = claim.receiver_id if stored; else for SF/SP payers → their TPA;
+#                 else payer_id itself (direct-payer case, Receiver == Payer)
+#   Payer Name  = lookup payer_id in combined map
+#   Receiver Name = lookup derived receiver_id in combined map
+# ---------------------------------------------------------------------------
+def _load_payer_map() -> tuple[dict[str, str], dict[str, str]]:
+    """Returns (payer_name_map, sp_to_tpa_map)."""
+    data_dir = _os.path.normpath(_os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+        "..", "data",
+    ))
+    pmap: dict[str, str] = {}
+    sp_tpa: dict[str, str] = {}
+
+    # Standard payers + TPA codes (col 0 = ID, col 1 = Name)
+    payers_path = _os.path.join(data_dir, "payers.xlsx")
+    if _os.path.exists(payers_path):
+        try:
+            wb = _openpyxl.load_workbook(payers_path, read_only=True, data_only=True)
+            ws = wb.active
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row and row[0] and row[1]:
+                    pmap[str(row[0]).strip()] = str(row[1]).strip()
+            wb.close()
+        except Exception:
+            pass
+
+    # Self-paid employer codes (col 0 = SF/SP ID, col 1 = Name, col 2 = TPA)
+    sp_path = _os.path.join(data_dir, "self_paid.xlsx")
+    if _os.path.exists(sp_path):
+        try:
+            wb = _openpyxl.load_workbook(sp_path, read_only=True, data_only=True)
+            ws = wb.active
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row and row[0]:
+                    code = str(row[0]).strip()
+                    name = str(row[1]).strip() if row[1] else code
+                    tpa  = str(row[2]).strip() if len(row) > 2 and row[2] else ""
+                    pmap[code] = name
+                    if tpa:
+                        sp_tpa[code] = tpa
+            wb.close()
+        except Exception:
+            pass
+
+    return pmap, sp_tpa
+
+
+_PAYER_MAP: dict[str, str]
+_SP_TPA_MAP: dict[str, str]
+_PAYER_MAP, _SP_TPA_MAP = _load_payer_map()
+
+
+def _payer_name(code: Optional[str]) -> str:
+    if not code:
+        return ""
+    return _PAYER_MAP.get(code.strip(), code.strip())
+
+
+def _derive_receiver_id(raw_receiver_id: Optional[str], payer_id: Optional[str]) -> str:
+    """
+    Return the correct Receiver ID:
+      1. Use stored receiver_id if it's a real eClaimLink code (not a facility DHA-F- license)
+      2. For SF/SP self-paid payers, receiver = their TPA code
+      3. Otherwise receiver == payer (direct-payer submission)
+    """
+    rid = (raw_receiver_id or "").strip()
+    # Facility DHA license IDs start with DHA-F- — these are NOT valid receivers
+    if rid and not rid.upper().startswith("DHA-F-"):
+        return rid
+    pid = (payer_id or "").strip()
+    if pid in _SP_TPA_MAP:
+        return _SP_TPA_MAP[pid]
+    return pid
 
 # ---------------------------------------------------------------------------
 # Styling
@@ -110,6 +347,22 @@ def _auto_width(ws, cols: list[str]) -> None:
         ws.column_dimensions[get_column_letter(i)].width = min(len(name) + 4, 32)
 
 
+# DHA XML encounter type codes → human-readable labels
+_ENCOUNTER_TYPE_LABELS: dict[str, str] = {
+    "1": "OP",   # Outpatient
+    "2": "IP",   # Inpatient
+    "3": "ER",   # Emergency
+    "4": "OT",   # Others
+}
+
+
+def _enc_label(code: Optional[str]) -> str:
+    """Map DHA numeric encounter type code to a readable label."""
+    if not code:
+        return ""
+    return _ENCOUNTER_TYPE_LABELS.get(str(code).strip(), str(code).strip())
+
+
 def _fmt_date(d) -> str:
     if d is None:
         return ""
@@ -163,8 +416,8 @@ CLAIM_SUMMARY_COLS = [
     "Payer ID", "Payer Name", "Member Id",
     "Treatment Date", "Submission Date", "Encounter Type",
     "Clinician Name", "Submission Level",
-    "Net Amt - Initial Sub", "Approved Amt",
-    "Rejected Amt", "Unsettled Amt",
+    "Net Amt - Initial Sub", "RA Net",
+    "Approved Amt", "Rejected Amt", "Resubmitted Amt", "Unsettled Amt",
     "Payment Status", "Denial Code", "Denial Description",
     "RA Date", "TAT (Days)",
 ]
@@ -172,7 +425,8 @@ CLAIM_SUMMARY_COLS = [
 
 def _build_claim_summary(db, facility_id, payer_id, encounter_type,
                          date_from, date_to, date_field):
-    fac_map = {f.id: f.facility_name for f in db.query(Facility).all()}
+    # fac_map: id → (facility_name, license_id)  — used for receiver fallback
+    fac_map = {f.id: (f.facility_name, f.license_id) for f in db.query(Facility).all()}
 
     latest_rem_sq = (
         db.query(
@@ -185,13 +439,64 @@ def _build_claim_summary(db, facility_id, payer_id, encounter_type,
     )
     latest_rem = aliased(Remittance)
 
+    # Resubmission subquery: for each original claim, find total net of
+    # resubmission claims with same facility + member + encounter date
+    resub_sq = (
+        db.query(
+            Claim.facility_id.label("fid"),
+            Claim.member_id.label("mid"),
+            cast(Claim.encounter_start, Date).label("enc_date"),
+            func.sum(Claim.net_amount).label("resub_amt"),
+        )
+        .filter(Claim.resubmission_count > 0)
+        .group_by(
+            Claim.facility_id,
+            Claim.member_id,
+            cast(Claim.encounter_start, Date),
+        )
+        .subquery()
+    )
+
+    # 2nd-RA subquery: resubmission claims that have ALSO received their own RA.
+    # resub_net > resub_paid → still has receivable after 2nd adjudication → "Reconcilable"
+    resub_ra_sq = (
+        db.query(
+            Claim.facility_id.label("fid"),
+            Claim.member_id.label("mid"),
+            cast(Claim.encounter_start, Date).label("enc_date"),
+            func.sum(Claim.net_amount).label("resub_net"),
+            func.sum(Remittance.paid_amount).label("resub_paid"),
+        )
+        .join(Remittance, Remittance.claim_id == Claim.claim_id)
+        .filter(Claim.resubmission_count > 0)
+        .group_by(
+            Claim.facility_id,
+            Claim.member_id,
+            cast(Claim.encounter_start, Date),
+        )
+        .subquery()
+    )
+
     q = (
-        db.query(Claim, latest_rem)
+        db.query(Claim, latest_rem, resub_sq.c.resub_amt,
+                 resub_ra_sq.c.resub_net, resub_ra_sq.c.resub_paid)
         .outerjoin(latest_rem_sq, and_(
             Claim.facility_id == latest_rem_sq.c.facility_id,
             Claim.claim_id    == latest_rem_sq.c.claim_id,
         ))
         .outerjoin(latest_rem, latest_rem.id == latest_rem_sq.c.max_id)
+        .outerjoin(resub_sq, and_(
+            Claim.facility_id == resub_sq.c.fid,
+            Claim.member_id   == resub_sq.c.mid,
+            cast(Claim.encounter_start, Date) == resub_sq.c.enc_date,
+            Claim.resubmission_count == 0,   # only attach to original claims
+        ))
+        .outerjoin(resub_ra_sq, and_(
+            Claim.facility_id == resub_ra_sq.c.fid,
+            Claim.member_id   == resub_ra_sq.c.mid,
+            cast(Claim.encounter_start, Date) == resub_ra_sq.c.enc_date,
+            Claim.resubmission_count == 0,
+        ))
     )
     q = _apply_filters(q, facility_id, payer_id, encounter_type,
                        date_from, date_to, date_field, rem_model=latest_rem)
@@ -203,22 +508,54 @@ def _build_claim_summary(db, facility_id, payer_id, encounter_type,
     ws.freeze_panes = "A2"
     _write_headers(ws, CLAIM_SUMMARY_COLS)
 
-    for row_idx, (claim, rem) in enumerate(rows, start=2):
+    for row_idx, (claim, rem, resub_amt, resub_net, resub_paid) in enumerate(rows, start=2):
+        fac_name, fac_license = fac_map.get(claim.facility_id, ("", ""))
         sub_level = "Resubmission" if claim.resubmission_count > 0 else "Initial Submission"
-        approved  = _f(rem.paid_amount)   if rem else ""
-        rejected  = _f(rem.denial_amount) if rem else ""
-        net       = _f(claim.net_amount)
+
+        # --- Financial calculations ---
+        net_sub  = float(claim.net_amount) if claim.net_amount is not None else None
+        ra_net   = float(rem.net_amount)   if rem and rem.net_amount   is not None else ""
+        paid     = float(rem.paid_amount)  if rem and rem.paid_amount  is not None else None
+
+        approved  = _f(paid) if paid is not None else ""
         unsettled = ""
-        if rem and claim.net_amount is not None and rem.paid_amount is not None:
-            try:
-                unsettled = round(float(claim.net_amount) - float(rem.paid_amount), 2)
-            except Exception:
-                pass
-        pay_status = rem.claim_status_ra or ""   if rem else ""
-        den_code   = rem.denial_code or ""        if rem else ""
-        den_desc   = rem.denial_description or "" if rem else ""
-        ra_date    = _fmt_date(rem.remittance_date) if rem else ""
-        tat        = ""
+        rejected  = ""
+        pay_status = ""
+
+        if net_sub is not None and paid is not None:
+            rejected  = round(max(0.0, net_sub - paid), 2)
+            has_resub          = resub_amt  is not None and float(resub_amt)  > 0
+            resub_has_ra       = resub_net  is not None   # 2nd RA received
+            resub_receivable   = resub_has_ra and float(resub_net or 0) > float(resub_paid or 0)
+            if paid >= net_sub:
+                pay_status = "Fully Paid"
+            elif rejected > 0 and resub_has_ra and resub_receivable:
+                pay_status = "Reconcilable"
+            elif rejected > 0 and has_resub:
+                pay_status = "Resub Awaiting Adjudication"
+            elif paid == 0.0 and not has_resub:
+                pay_status = "Fully Rejected"
+            else:
+                pay_status = "Partially Paid"
+        elif rem:
+            # RA exists but claim net missing
+            pay_status = rem.claim_status_ra or ""
+        else:
+            # No RA received yet
+            pay_status = "Unpaid"
+
+        # Unsettled = full claim amount for everything except Fully Paid
+        if pay_status != "Fully Paid":
+            if net_sub is not None and paid is not None:
+                unsettled = round(net_sub - paid, 2)
+            elif net_sub is not None:
+                # No RA yet (Unpaid) — entire claim is unsettled
+                unsettled = net_sub
+
+        den_code  = rem.denial_code        or "" if rem else ""
+        den_desc  = rem.denial_description or "" if rem else ""
+        ra_date   = _fmt_date(rem.remittance_date) if rem else ""
+        tat       = ""
         if rem and rem.remittance_date and claim.submission_date:
             try:
                 tat = (rem.remittance_date - claim.submission_date).days
@@ -226,19 +563,23 @@ def _build_claim_summary(db, facility_id, payer_id, encounter_type,
                 pass
 
         _write_row(ws, row_idx, [
-            fac_map.get(claim.facility_id, ""),
+            fac_name,
             claim.claim_id,
-            claim.receiver_id or "",
-            claim.receiver_name or "",
+            _derive_receiver_id(claim.receiver_id, claim.payer_id),
+            _payer_name(_derive_receiver_id(claim.receiver_id, claim.payer_id)),
             claim.payer_id,
-            claim.payer_name or "",
+            _payer_name(claim.payer_id),
             claim.member_id,
             _fmt_date(claim.encounter_start),
             _fmt_date(claim.submission_date),
-            claim.encounter_type or "",
-            claim.clinician_name or "",
+            _enc_label(claim.encounter_type),
+            claim.clinician_name or claim.clinician_id or "",
             sub_level,
-            net, approved, rejected, unsettled,
+            _f(net_sub) if net_sub is not None else "",
+            ra_net,
+            approved, rejected,
+            _f(resub_amt) if resub_amt is not None else "",
+            unsettled,
             pay_status, den_code, den_desc, ra_date, tat,
         ], alt=(row_idx % 2 == 0))
 
@@ -278,7 +619,7 @@ CLAIM_ACTIVITY_COLS = [
 
 def _build_claim_activity(db, facility_id, payer_id, encounter_type,
                           date_from, date_to, date_field):
-    fac_map = {f.id: f.facility_name for f in db.query(Facility).all()}
+    fac_map = {f.id: (f.facility_name, f.license_id) for f in db.query(Facility).all()}
 
     q = (
         db.query(ClaimActivity, Claim)
@@ -305,13 +646,14 @@ def _build_claim_activity(db, facility_id, payer_id, encounter_type,
     _write_headers(ws, CLAIM_ACTIVITY_COLS)
 
     for row_idx, (act, claim) in enumerate(rows, start=2):
+        fac_name, fac_license = fac_map.get(claim.facility_id, ("", ""))
         _write_row(ws, row_idx, [
-            fac_map.get(claim.facility_id, ""),
+            fac_name,
             claim.claim_id,
-            claim.receiver_id or "",
-            claim.receiver_name or "",
+            _derive_receiver_id(claim.receiver_id, claim.payer_id),
+            _payer_name(_derive_receiver_id(claim.receiver_id, claim.payer_id)),
             claim.payer_id,
-            claim.payer_name or "",
+            _payer_name(claim.payer_id),
             claim.member_id,
             _fmt_date(act.activity_start),
             _fmt_date(act.activity_start),
@@ -509,7 +851,7 @@ def _build_resubmission_aging(db, facility_id, payer_id, encounter_type,
             claim.payer_name or "",
             claim.member_id,
             _fmt_date(claim.submission_date),
-            claim.encounter_type or "",
+            _enc_label(claim.encounter_type),
             net, approved, unsettled,
             claim.resubmission_count,
             days_out,
@@ -558,19 +900,83 @@ REMITTANCE_ACTIVITY_COLS = [
     "Activity Code", "Activity Type", "Activity Type Name",
     "No Of Unit", "Gross Amt", "Net Amt", "Patient Share",
     "Payment Amt", "Denial Code", "Denial Description", "Denial Category",
+    "Denial Type",
+    "Activity Detail ID",
+    "RASubmission File Name",
+    "RAFille Id",
+    "Claim Submission File Name",
+    "Response Comments",
+    "RAPament For",
 ]
+
+
+def _ra_payment_for(rem_id: int, ra_rank_map: dict, dup_rem_ids: set) -> str:
+    """Universal RAPament For computation — facility and filename agnostic.
+
+    Based purely on remittance chronology per claim:
+      - Duplicate RA   : same ra_file_id processed >1 time for same claim
+      - 1st RA         : earliest remittance for this claim
+      - Resubmission RA Claim Level - N : Nth subsequent remittance (N >= 1)
+    """
+    if rem_id in dup_rem_ids:
+        return "Duplicate RA"
+    rank = ra_rank_map.get(rem_id, 1)
+    if rank == 1:
+        return "1st RA"
+    return f"Resubmission RA Claim Level - {rank - 1}"
 
 
 def _build_remittance_activity(db, facility_id, payer_id, encounter_type,
                                date_from, date_to, date_field):
     fac_map = {f.id: (f.facility_name, f.license_id) for f in db.query(Facility).all()}
 
+    # ------------------------------------------------------------------
+    # Pre-compute RA rank per claim (ordered by remittance_date, then id)
+    # and duplicate remittance IDs (same ra_file_id for same claim > once)
+    # ------------------------------------------------------------------
+    from sqlalchemy import text as _text
+    rank_rows = db.execute(_text("""
+        SELECT id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY facility_id, claim_id
+                   ORDER BY remittance_date, id
+               ) AS ra_rank
+        FROM remittances
+    """)).fetchall()
+    ra_rank_map = {row[0]: row[1] for row in rank_rows}
+
+    dup_rows = db.execute(_text("""
+        SELECT r.id
+        FROM remittances r
+        JOIN (
+            SELECT facility_id, claim_id, ra_file_id
+            FROM remittances
+            WHERE ra_file_id IS NOT NULL
+            GROUP BY facility_id, claim_id, ra_file_id
+            HAVING COUNT(*) > 1
+        ) dup ON r.facility_id = dup.facility_id
+              AND r.claim_id   = dup.claim_id
+              AND r.ra_file_id = dup.ra_file_id
+    """)).fetchall()
+    dup_rem_ids = {row[0] for row in dup_rows}
+
+    ra_xml_store    = aliased(RawXmlStore)
+    claim_xml_store = aliased(RawXmlStore)
+    act_alias       = aliased(ClaimActivity)
+
     q = (
-        db.query(RemittanceActivityDetail, Remittance, Claim)
+        db.query(RemittanceActivityDetail, Remittance, Claim,
+                 ra_xml_store, claim_xml_store, act_alias)
         .join(Remittance, Remittance.id == RemittanceActivityDetail.remittance_id_fk)
         .join(Claim, and_(
             Claim.facility_id == Remittance.facility_id,
             Claim.claim_id    == Remittance.claim_id,
+        ))
+        .outerjoin(ra_xml_store,    ra_xml_store.id    == Remittance.raw_xml_id)
+        .outerjoin(claim_xml_store, claim_xml_store.id == Claim.raw_xml_id)
+        .outerjoin(act_alias, and_(
+            act_alias.claim_id_fk  == Claim.id,
+            act_alias.activity_id  == RemittanceActivityDetail.activity_id,
         ))
     )
     if facility_id:
@@ -600,31 +1006,51 @@ def _build_remittance_activity(db, facility_id, payer_id, encounter_type,
     ws.freeze_panes = "A2"
     _write_headers(ws, REMITTANCE_ACTIVITY_COLS)
 
-    for row_idx, (rad, rem, claim) in enumerate(rows, start=2):
-        fac_name  = fac_map.get(rem.facility_id, ("", ""))[0]
+    for row_idx, (rad, rem, claim, ra_xml_row, claim_xml_row, act_row) in enumerate(rows, start=2):
         enc_start = claim.encounter_start
         enc_year  = enc_start.year  if enc_start else ""
         enc_month = enc_start.month if enc_start else ""
 
+        fac_name, fac_license = fac_map.get(rem.facility_id, ("", ""))
+
+        # Denial lookups from DHA code set
+        den_code = rad.denial_code or ""
+        den_desc, den_cat, den_type = _lookup_denial(den_code)
+
+        # Clinician: prefer activity-level ID, fall back to claim-level
+        act_clin_id = (act_row.clinician_id if act_row else None) or claim.clinician_id
+        ord_clin_id = (
+            getattr(act_row, "ordering_clinician_id", None) if act_row else None
+        ) or act_clin_id
+        clinician     = _clinician_name(act_clin_id)
+        ord_clinician = _clinician_name(ord_clin_id)
+
         _write_row(ws, row_idx, [
             rem.facility_id, fac_name,
-            claim.receiver_id or "", claim.receiver_name or "",
-            claim.payer_id, claim.payer_name or "",
+            _derive_receiver_id(claim.receiver_id, claim.payer_id),
+            _payer_name(_derive_receiver_id(claim.receiver_id, claim.payer_id)),
+            claim.payer_id, _payer_name(claim.payer_id),
             claim.member_id, claim.member_id, claim.emirates_id or "",
             _fmt_date(enc_start), _fmt_date(claim.encounter_end),
             enc_year, enc_month,
             _fmt_date(claim.submission_date), _fmt_date(claim.submission_date),
             _fmt_date(rem.remittance_date),
-            claim.claim_id, claim.encounter_type or "", claim.end_type or "",
+            claim.claim_id, _enc_label(claim.encounter_type), claim.end_type or "",
             claim.claim_id_payer or "", rem.ra_file_id or "",
             _fmt_date(rem.remittance_date),
             _fmt_date(enc_start),
-            claim.clinician_name or claim.clinician_id or "",
-            claim.clinician_name or claim.clinician_id or "",
+            clinician, ord_clinician,
             rad.activity_code or "", rad.activity_type or "", rad.activity_type or "",
             _f(rad.quantity_approved), _f(rad.gross), _f(rad.net),
             _f(rad.patient_share), _f(rad.paid_amount),
-            rad.denial_code or "", rad.denial_description or "", "",
+            den_code, den_desc, den_cat,
+            den_type,                                                # Denial Type
+            rad.activity_id or "",                                   # Activity Detail ID
+            ra_xml_row.source_filename    if ra_xml_row    else "",  # RASubmission File Name
+            rem.ra_file_id or "",                                    # RAFille Id
+            claim_xml_row.source_filename if claim_xml_row else "",  # Claim Submission File Name
+            rad.denial_description or rem.denial_description or "",    # Response Comments
+            _ra_payment_for(rem.id, ra_rank_map, dup_rem_ids),        # RAPament For
         ], alt=(row_idx % 2 == 0))
 
     _auto_width(ws, REMITTANCE_ACTIVITY_COLS)
@@ -723,8 +1149,9 @@ def _build_denial_query(db, facility_id, payer_id, encounter_type,
 
         _write_row(ws, row_idx, [
             ra_history, sub_level, lic_no, fac_name,
-            claim.receiver_id or "", claim.receiver_name or "",
-            claim.payer_id, claim.payer_name or "",
+            _derive_receiver_id(claim.receiver_id, claim.payer_id),
+            _payer_name(_derive_receiver_id(claim.receiver_id, claim.payer_id)),
+            claim.payer_id, _payer_name(claim.payer_id),
             claim.member_id, claim.emirates_id or "",
             claim.claim_id,
             rem.claim_status_ra or "", rem.ra_file_id or "",
@@ -908,16 +1335,42 @@ def download_report_job(
     current_user=Depends(get_current_user),
 ):
     """Download the Excel file for a previously generated report job."""
-    job = db.get(ReportJob, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Report job not found")
-    if not job.file_data:
-        raise HTTPException(status_code=400,
-                            detail="No file available for this job (status: " + job.status + ")")
-    return StreamingResponse(
-        io.BytesIO(job.file_data),
-        headers={
-            "Content-Disposition": f'attachment; filename="{job.filename or "report.xlsx"}"',
-            "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        },
-    )
+    import traceback as _tb
+    try:
+        from sqlalchemy import text as _text
+        row = db.execute(
+            _text("SELECT file_data, filename, status FROM report_jobs WHERE id = :id"),
+            {"id": job_id},
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Report job not found")
+        if not row.file_data:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No file available for this job (status: {row.status})",
+            )
+
+        raw = row.file_data
+        if isinstance(raw, memoryview):
+            data = bytes(raw)
+        elif isinstance(raw, bytes):
+            data = raw
+        elif isinstance(raw, str):
+            # PostgreSQL hex-bytea format: '\x504b...'
+            hex_str = raw[2:] if raw.startswith("\\x") else raw
+            data = bytes.fromhex(hex_str)
+        else:
+            raise ValueError(f"Unexpected file_data type: {type(raw)}")
+
+        return StreamingResponse(
+            io.BytesIO(data),
+            headers={
+                "Content-Disposition": f'attachment; filename="{row.filename or "report.xlsx"}"',
+                "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail=_tb.format_exc())

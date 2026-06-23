@@ -61,6 +61,8 @@ class FacilityOut(BaseModel):
     id: int
     facility_code: str
     facility_name: str
+    dhpo_provider_id: Optional[str] = None
+    eclaimlink_username: Optional[str] = None
     is_active: bool
 
 

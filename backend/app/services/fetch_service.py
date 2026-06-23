@@ -32,8 +32,8 @@ from __future__ import annotations
 import io
 import logging
 import zipfile
-from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Set
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -61,6 +61,10 @@ DIRECTION_RECEIVED = 2
 
 # Successful return codes (0 = success, 1 = success with warnings, 2/3 = no new data)
 DHPO_OK_CODES = {0, 1, 2, 3}
+
+# DHPO hard cap on SearchTransactions results per call.
+# When exactly this many results are returned the range must be split.
+DHPO_SEARCH_CAP = 500
 
 # XML types handled
 XML_TYPES = ("ClaimSubmission", "RemittanceAdvice")
@@ -218,7 +222,7 @@ class DHPOSoapClient:
             result = self._client.service.SetTransactionDownloaded(
                 login=login,
                 pwd=pwd,
-                fileId=file_id,
+                fieldId=file_id,
             )
             return_code = result.setTransactionDownloadedResult
             error_msg   = result.errorMessage or ""
@@ -294,13 +298,136 @@ def _extract_xml_from_bytes(raw: bytes, filename: str) -> List[Dict[str, Any]]:
 
 
 def _parse_tx_date(date_str: str) -> Optional[date]:
-    """Parse 'dd/MM/yyyy HH:mm:ss' → date, or return None."""
-    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
+    """Parse eClaimLink TransactionDate in any common format → date, or return None."""
+    if not date_str:
+        return None
+    date_str = date_str.strip()
+    for fmt in (
+        "%d/%m/%Y %H:%M:%S",    # 15/05/2026 08:25:56   ← primary DHPO format
+        "%d/%m/%Y %I:%M:%S %p", # 15/05/2026 08:25:56 AM  (AM/PM variant)
+        "%d/%m/%Y %H:%M",       # 15/05/2026 08:25
+        "%d/%m/%Y",             # 15/05/2026
+        "%Y-%m-%dT%H:%M:%S",    # 2026-05-15T08:25:56  (ISO)
+        "%Y-%m-%d",             # 2026-05-15
+        "%m/%d/%Y %H:%M:%S",    # 05/15/2026 08:25:56  (US format)
+        "%m/%d/%Y",             # 05/15/2026
+    ):
         try:
-            return datetime.strptime(date_str.strip(), fmt).date()
+            return datetime.strptime(date_str, fmt).date()
         except (ValueError, AttributeError):
             continue
     return None
+
+
+def _parse_date_from_filename(filename: str) -> Optional[date]:
+    """Extract submission date embedded in DHA eClaimLink filenames.
+
+    Common patterns:
+      TPA029-DHA-F-0047100-MAY-2026-SUB-15052026082556AM.xml  → 2026-05-15
+      OP-AC-CR-TPA029-0047100-15052026123045PM.xml             → 2026-05-15
+
+    The date is encoded as DDMMYYYY followed by optional HHMMSS + AM/PM.
+    Year is anchored to 20xx to avoid false matches on other 8-digit sequences.
+    """
+    import re
+    m = re.search(r'(\d{2})(\d{2})(20\d{2})\d{6}(?:AM|PM)', filename, re.IGNORECASE)
+    if m:
+        day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return date(year, month, day)
+        except ValueError:
+            pass
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Window-splitting search
+# ----------------------------------------------------------------------------
+def _search_with_splitting(
+    client: DHPOSoapClient,
+    login: str,
+    pwd: str,
+    direction: int,
+    caller_license: Optional[str],
+    tx_id: int,
+    date_from: date,
+    date_to: date,
+    tx_status: int,
+    seen_ids: Set[str],
+    depth: int = 0,
+) -> List[Dict]:
+    """
+    Calls SearchTransactions for [date_from, date_to].  If the result count
+    equals DHPO_SEARCH_CAP the server has capped the response and there may be
+    more files.  The date range is then bisected and each half is fetched
+    recursively until every sub-window returns fewer than DHPO_SEARCH_CAP files.
+
+    ``seen_ids`` is shared across all recursive calls so duplicates that appear
+    in overlapping sub-windows are silently dropped.
+
+    Max recursion depth: 12 (covers a 4096-day / ~11-year range down to
+    single days without any stack risk in practice).
+    """
+    if depth > 12:
+        log.warning(
+            "Window-split max depth reached for %s → %s (status=%d); "
+            "returning partial results.",
+            date_from, date_to, tx_status,
+        )
+
+    batch = client.search_transactions(
+        login=login,
+        pwd=pwd,
+        direction=direction,
+        caller_license=caller_license,
+        transaction_id=tx_id,
+        date_from=date_from,
+        date_to=date_to,
+        transaction_status=tx_status,
+    )
+
+    if len(batch) < DHPO_SEARCH_CAP or depth > 12:
+        # Under the cap (or recursion limit hit) — accept what we have
+        new_files = [d for d in batch if d["file_id"] not in seen_ids]
+        for d in new_files:
+            seen_ids.add(d["file_id"])
+        log.info(
+            "  window [%s → %s] status=%d depth=%d: %d file(s) returned, %d new",
+            date_from, date_to, tx_status, depth, len(batch), len(new_files),
+        )
+        return new_files
+
+    # Exactly DHPO_SEARCH_CAP (or more) — cap was hit
+    days = (date_to - date_from).days
+    if days == 0:
+        # Single-day window already at cap — nothing more we can do
+        log.warning(
+            "Single-day window %s still hits DHPO cap (%d files, status=%d). "
+            "Some files may be missing for this day.",
+            date_from, len(batch), tx_status,
+        )
+        new_files = [d for d in batch if d["file_id"] not in seen_ids]
+        for d in new_files:
+            seen_ids.add(d["file_id"])
+        return new_files
+
+    # Bisect: left half [date_from … mid], right half [mid+1 … date_to]
+    mid = date_from + timedelta(days=days // 2)
+    log.info(
+        "SearchTransactions hit cap (%d) for [%s → %s] status=%d — "
+        "splitting at %s (depth=%d)",
+        len(batch), date_from, date_to, tx_status, mid, depth,
+    )
+
+    left = _search_with_splitting(
+        client, login, pwd, direction, caller_license, tx_id,
+        date_from, mid, tx_status, seen_ids, depth + 1,
+    )
+    right = _search_with_splitting(
+        client, login, pwd, direction, caller_license, tx_id,
+        mid + timedelta(days=1), date_to, tx_status, seen_ids, depth + 1,
+    )
+    return left + right
 
 
 # ----------------------------------------------------------------------------
@@ -479,26 +606,29 @@ class DHASyncService:
         # Fetch both new (status=1) and already-downloaded (status=2) files.
         # status=2 captures files previously downloaded via the eClaimLink portal
         # that were never pulled through this API.
+        #
+        # _search_with_splitting automatically bisects the date window whenever
+        # DHPO returns exactly 500 results (its hard cap), recursing until every
+        # sub-window returns < 500 — so no files are silently missed.
         file_descriptors: List[Dict] = []
-        seen_ids: set = set()
+        seen_ids: Set[str] = set()
         for tx_status in (1, 2):
             try:
-                batch = client.search_transactions(
+                batch = _search_with_splitting(
+                    client=client,
                     login=login,
                     pwd=pwd,
                     direction=direction,
                     caller_license=caller_license,
-                    transaction_id=tx_id,
+                    tx_id=tx_id,
                     date_from=date_from,
                     date_to=date_to,
-                    transaction_status=tx_status,
+                    tx_status=tx_status,
+                    seen_ids=seen_ids,
                 )
-                for d in batch:
-                    if d["file_id"] not in seen_ids:
-                        seen_ids.add(d["file_id"])
-                        file_descriptors.append(d)
+                file_descriptors.extend(batch)
                 log.info(
-                    "SearchTransactions status=%d returned %d file(s) for %s / %s",
+                    "SearchTransactions status=%d: %d unique file(s) for %s / %s",
                     tx_status, len(batch), facility.facility_code, xml_type,
                 )
             except Exception as exc:
@@ -515,10 +645,20 @@ class DHASyncService:
             file_id   = desc["file_id"]
             file_name = desc["file_name"] or f"file_{file_id}.xml"
             tx_date   = _parse_tx_date(desc.get("transaction_date", ""))
+            if tx_date is None:
+                tx_date = _parse_date_from_filename(file_name)
+                if tx_date:
+                    log.info("tx_date extracted from filename %s → %s", file_name, tx_date)
+                else:
+                    log.warning(
+                        "Could not parse TransactionDate '%s' from file '%s'; "
+                        "falling back to date_to=%s",
+                        desc.get("transaction_date", ""), file_name, date_to,
+                    )
 
             log.info(
-                "Downloading FileID=%s FileName=%s RecordCount=%s",
-                file_id, file_name, desc.get("record_count"),
+                "Downloading FileID=%s FileName=%s RecordCount=%s tx_date=%s",
+                file_id, file_name, desc.get("record_count"), tx_date,
             )
 
             try:
@@ -540,7 +680,8 @@ class DHASyncService:
                     "submission_date": tx_date or date_to,
                 })
 
-            # Mark as downloaded so GetNewTransactions won't return it again
-            client.set_transaction_downloaded(login, pwd, file_id)
+            # SetTransactionDownloaded intentionally skipped — we want files
+            # to remain available on DHPO's side for re-fetching if needed.
+            # client.set_transaction_downloaded(login, pwd, file_id)
 
         return payloads

@@ -336,10 +336,10 @@ class ClaimObservation(Base):
 
     id                 : Mapped[int]            = mapped_column(BigInteger, primary_key=True)
     activity_id_fk     : Mapped[int]            = mapped_column(BigInteger, ForeignKey("claim_activities.id", ondelete="CASCADE"), nullable=False)
-    claim_id_fk        : Mapped[int]            = mapped_column(BigInteger, ForeignKey("claims.id", ondelete="CASCADE"), nullable=False)
+    claim_id_fk        : Mapped[Optional[int]]  = mapped_column(BigInteger, ForeignKey("claims.id", ondelete="CASCADE"), nullable=True)
     observation_type   : Mapped[str]            = mapped_column(String(100), nullable=False)
     observation_code   : Mapped[Optional[str]]  = mapped_column(String(100))
-    observation_value  : Mapped[Optional[str]]  = mapped_column(String(500))
+    observation_value  : Mapped[Optional[str]]  = mapped_column(Text)
     value_type         : Mapped[Optional[str]]  = mapped_column(String(50))
     created_at         : Mapped[datetime]       = mapped_column(TIMESTAMPTZ, server_default=func.now())
 
@@ -408,6 +408,7 @@ class RemittanceActivityDetail(Base):
     patient_share      : Mapped[Decimal]        = mapped_column(Numeric(12, 2), nullable=False, default=0)
     denial_code        : Mapped[Optional[str]]  = mapped_column(String(50))
     denial_description : Mapped[Optional[str]]  = mapped_column(String(500))
+    denial_type        : Mapped[Optional[str]]  = mapped_column(String(100))
     quantity_approved  : Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 3))
     created_at         : Mapped[datetime]       = mapped_column(TIMESTAMPTZ, server_default=func.now())
 
