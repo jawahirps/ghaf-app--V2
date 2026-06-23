@@ -243,6 +243,9 @@ class Claim(Base):
     submission_date  : Mapped[date]          = mapped_column(Date, nullable=False)
     claim_status     : Mapped[str]           = mapped_column(String(30), nullable=False, default="submitted")
     resubmission_count: Mapped[int]          = mapped_column(SmallInteger, nullable=False, default=0)
+    # Resubmission type from <Resubmission><Type> in claim XML
+    # Values: NULL = initial, 'Correction', 'InternalComplaint', 'Reconciliation'
+    resubmission_type: Mapped[Optional[str]] = mapped_column(String(50))
 
     # Internal
     created_at       : Mapped[datetime]      = mapped_column(TIMESTAMPTZ, server_default=func.now())

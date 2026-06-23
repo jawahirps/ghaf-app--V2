@@ -265,6 +265,23 @@ def _payer_name(code: Optional[str]) -> str:
     return _PAYER_MAP.get(code.strip(), code.strip())
 
 
+def _submission_level(resubmission_type: Optional[str]) -> str:
+    """
+    Map the stored resubmission_type value to a human-readable label.
+      NULL / empty         → 'Submission'
+      Correction           → '1 Resubmission'
+      InternalComplaint    → '1 Resubmission'
+      Reconciliation       → 'Reconciliation Resubmission'
+      anything else        → '1 Resubmission'
+    """
+    if not resubmission_type:
+        return "Submission"
+    rt = resubmission_type.strip()
+    if rt.lower() == "reconciliation":
+        return "Reconciliation Resubmission"
+    return "1 Resubmission"
+
+
 def _derive_receiver_id(raw_receiver_id: Optional[str], payer_id: Optional[str]) -> str:
     """
     Return the correct Receiver ID:
@@ -448,7 +465,7 @@ def _build_claim_summary(db, facility_id, payer_id, encounter_type,
             cast(Claim.encounter_start, Date).label("enc_date"),
             func.sum(Claim.net_amount).label("resub_amt"),
         )
-        .filter(Claim.resubmission_count > 0)
+        .filter(Claim.resubmission_type.isnot(None))
         .group_by(
             Claim.facility_id,
             Claim.member_id,
@@ -468,7 +485,7 @@ def _build_claim_summary(db, facility_id, payer_id, encounter_type,
             func.sum(Remittance.paid_amount).label("resub_paid"),
         )
         .join(Remittance, Remittance.claim_id == Claim.claim_id)
-        .filter(Claim.resubmission_count > 0)
+        .filter(Claim.resubmission_type.isnot(None))
         .group_by(
             Claim.facility_id,
             Claim.member_id,
@@ -489,13 +506,13 @@ def _build_claim_summary(db, facility_id, payer_id, encounter_type,
             Claim.facility_id == resub_sq.c.fid,
             Claim.member_id   == resub_sq.c.mid,
             cast(Claim.encounter_start, Date) == resub_sq.c.enc_date,
-            Claim.resubmission_count == 0,   # only attach to original claims
+            Claim.resubmission_type.is_(None),   # only attach to original claims
         ))
         .outerjoin(resub_ra_sq, and_(
             Claim.facility_id == resub_ra_sq.c.fid,
             Claim.member_id   == resub_ra_sq.c.mid,
             cast(Claim.encounter_start, Date) == resub_ra_sq.c.enc_date,
-            Claim.resubmission_count == 0,
+            Claim.resubmission_type.is_(None),
         ))
     )
     q = _apply_filters(q, facility_id, payer_id, encounter_type,
@@ -510,7 +527,7 @@ def _build_claim_summary(db, facility_id, payer_id, encounter_type,
 
     for row_idx, (claim, rem, resub_amt, resub_net, resub_paid) in enumerate(rows, start=2):
         fac_name, fac_license = fac_map.get(claim.facility_id, ("", ""))
-        sub_level = "Resubmission" if claim.resubmission_count > 0 else "Initial Submission"
+        sub_level = _submission_level(claim.resubmission_type)
 
         # --- Financial calculations ---
         net_sub  = float(claim.net_amount) if claim.net_amount is not None else None
@@ -853,7 +870,7 @@ def _build_resubmission_aging(db, facility_id, payer_id, encounter_type,
             _fmt_date(claim.submission_date),
             _enc_label(claim.encounter_type),
             net, approved, unsettled,
-            claim.resubmission_count,
+            _submission_level(claim.resubmission_type),
             days_out,
             _bucket(days_out),
             rem.claim_status_ra or "Pending" if rem else "Pending",
@@ -1144,8 +1161,8 @@ def _build_denial_query(db, facility_id, payer_id, encounter_type,
 
     for row_idx, (claim, rem, first_cpt) in enumerate(rows, start=2):
         fac_name, lic_no = fac_map.get(claim.facility_id, ("", ""))
-        sub_level  = "Resubmission" if claim.resubmission_count > 0 else "Initial Submission"
-        ra_history = claim.resubmission_count
+        sub_level  = _submission_level(claim.resubmission_type)
+        ra_history = 1 if claim.resubmission_type else 0
 
         _write_row(ws, row_idx, [
             ra_history, sub_level, lic_no, fac_name,

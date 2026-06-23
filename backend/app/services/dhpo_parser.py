@@ -202,6 +202,7 @@ class DHPOXmlParser:
                 patient_share_total=self._parse_decimal(elem.findtext("PatientShare")),
                 submission_date=record.submission_date or datetime.utcnow().date(),
                 claim_status="submitted",
+                resubmission_type=elem.findtext("Resubmission/Type"),
             )
 
             # 1. Nested Diagnoses
