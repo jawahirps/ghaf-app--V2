@@ -16,11 +16,18 @@ from sqlalchemy import (
     Integer, LargeBinary, Numeric, SmallInteger, String, Text, UniqueConstraint,
     CheckConstraint, Index, text
 )
-from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
+from sqlalchemy import JSON
+from sqlalchemy.dialects.postgresql import JSONB as PG_JSONB, TIMESTAMP
 
 # SQLAlchemy's postgresql dialect doesn't export a TIMESTAMPTZ name directly;
 # this is just TIMESTAMP WITH TIME ZONE.
 TIMESTAMPTZ = TIMESTAMP(timezone=True)
+
+# Portable JSON: JSONB on Postgres, plain JSON elsewhere (e.g. SQLite dev DB).
+JSONB = JSON().with_variant(PG_JSONB(), "postgresql")
+
+# SQLite only autoincrements INTEGER primary keys, so BIGINT PKs need this variant.
+BigIntPK = BigInteger().with_variant(Integer, "sqlite")
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -95,7 +102,7 @@ class User(Base):
 class LoginLog(Base):
     __tablename__ = "login_logs"
 
-    id               : Mapped[int]           = mapped_column(BigInteger, primary_key=True)
+    id               : Mapped[int]           = mapped_column(BigIntPK, primary_key=True)
     user_id          : Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"))
     email_attempted  : Mapped[str]           = mapped_column(String(255), nullable=False)
     success          : Mapped[bool]          = mapped_column(Boolean, nullable=False)
@@ -167,7 +174,7 @@ class ClinicalProfile(Base):
 class RawXmlStore(Base):
     __tablename__ = "raw_xml_store"
 
-    id               : Mapped[int]           = mapped_column(BigInteger, primary_key=True)
+    id               : Mapped[int]           = mapped_column(BigIntPK, primary_key=True)
     facility_id      : Mapped[int]           = mapped_column(Integer, ForeignKey("facilities.id"), nullable=False)
     xml_type         : Mapped[str]           = mapped_column(String(20), nullable=False)
     source_filename  : Mapped[Optional[str]] = mapped_column(String(500))
@@ -196,7 +203,7 @@ class RawXmlStore(Base):
 class Claim(Base):
     __tablename__ = "claims"
 
-    id               : Mapped[int]           = mapped_column(BigInteger, primary_key=True)
+    id               : Mapped[int]           = mapped_column(BigIntPK, primary_key=True)
     facility_id      : Mapped[int]           = mapped_column(Integer, ForeignKey("facilities.id"), nullable=False)
 
     # Made nullable to allow historical imports from Excel without breaking constraints
@@ -278,7 +285,7 @@ class Claim(Base):
 class ClaimDiagnosis(Base):
     __tablename__ = "claim_diagnoses"
 
-    id                 : Mapped[int]           = mapped_column(BigInteger, primary_key=True)
+    id                 : Mapped[int]           = mapped_column(BigIntPK, primary_key=True)
     claim_id_fk        : Mapped[int]           = mapped_column(BigInteger, ForeignKey("claims.id", ondelete="CASCADE"), nullable=False)
     facility_id        : Mapped[int]           = mapped_column(Integer, ForeignKey("facilities.id"), nullable=False)
     diagnosis_type     : Mapped[str]           = mapped_column(String(20), nullable=False)
@@ -302,7 +309,7 @@ class ClaimDiagnosis(Base):
 class ClaimActivity(Base):
     __tablename__ = "claim_activities"
 
-    id                 : Mapped[int]            = mapped_column(BigInteger, primary_key=True)
+    id                 : Mapped[int]            = mapped_column(BigIntPK, primary_key=True)
     claim_id_fk        : Mapped[int]            = mapped_column(BigInteger, ForeignKey("claims.id", ondelete="CASCADE"), nullable=False)
     facility_id        : Mapped[int]            = mapped_column(Integer, ForeignKey("facilities.id"), nullable=False)
     activity_id        : Mapped[Optional[str]]  = mapped_column(String(100))
@@ -337,7 +344,7 @@ class ClaimActivity(Base):
 class ClaimObservation(Base):
     __tablename__ = "claim_observations"
 
-    id                 : Mapped[int]            = mapped_column(BigInteger, primary_key=True)
+    id                 : Mapped[int]            = mapped_column(BigIntPK, primary_key=True)
     activity_id_fk     : Mapped[int]            = mapped_column(BigInteger, ForeignKey("claim_activities.id", ondelete="CASCADE"), nullable=False)
     claim_id_fk        : Mapped[Optional[int]]  = mapped_column(BigInteger, ForeignKey("claims.id", ondelete="CASCADE"), nullable=True)
     observation_type   : Mapped[str]            = mapped_column(String(100), nullable=False)
@@ -355,7 +362,7 @@ class ClaimObservation(Base):
 class Remittance(Base):
     __tablename__ = "remittances"
 
-    id                 : Mapped[int]            = mapped_column(BigInteger, primary_key=True)
+    id                 : Mapped[int]            = mapped_column(BigIntPK, primary_key=True)
     facility_id        : Mapped[int]            = mapped_column(Integer, ForeignKey("facilities.id"), nullable=False)
 
     # Made nullable to accommodate Excel-extracted Adjudication baselines
@@ -399,7 +406,7 @@ class Remittance(Base):
 class RemittanceActivityDetail(Base):
     __tablename__ = "remittance_activity_details"
 
-    id                 : Mapped[int]            = mapped_column(BigInteger, primary_key=True)
+    id                 : Mapped[int]            = mapped_column(BigIntPK, primary_key=True)
     remittance_id_fk   : Mapped[int]            = mapped_column(BigInteger, ForeignKey("remittances.id", ondelete="CASCADE"), nullable=False)
     facility_id        : Mapped[int]            = mapped_column(Integer, ForeignKey("facilities.id"), nullable=False)
     activity_id        : Mapped[Optional[str]]  = mapped_column(String(100))
@@ -424,7 +431,7 @@ class RemittanceActivityDetail(Base):
 class ReconResult(Base):
     __tablename__ = "recon_results"
 
-    id                     : Mapped[int]               = mapped_column(BigInteger, primary_key=True)
+    id                     : Mapped[int]               = mapped_column(BigIntPK, primary_key=True)
     facility_id            : Mapped[int]               = mapped_column(Integer, ForeignKey("facilities.id"), nullable=False)
     claim_id               : Mapped[str]               = mapped_column(String(100), nullable=False)
     claim_pk               : Mapped[Optional[int]]     = mapped_column(BigInteger, ForeignKey("claims.id"))
@@ -460,7 +467,7 @@ class ReconResult(Base):
 class FetchLog(Base):
     __tablename__ = "fetch_log"
 
-    id                 : Mapped[int]            = mapped_column(BigInteger, primary_key=True)
+    id                 : Mapped[int]            = mapped_column(BigIntPK, primary_key=True)
     facility_id        : Mapped[int]            = mapped_column(Integer, ForeignKey("facilities.id"), nullable=False)
     fetch_type         : Mapped[str]            = mapped_column(String(20), nullable=False)
     date_from          : Mapped[date]           = mapped_column(Date, nullable=False)
