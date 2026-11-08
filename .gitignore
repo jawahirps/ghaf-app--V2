@@ -40,3 +40,6 @@ logs/
 # Database dumps / exports
 *.sql
 *.dump
+
+# Local SQLite database
+*.db
