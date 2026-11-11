@@ -53,6 +53,39 @@ class LoginLogOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Passkeys (WebAuthn)
+# ---------------------------------------------------------------------------
+class PasskeyOptionsOut(BaseModel):
+    challenge_id: str
+    options: str  # WebAuthn options as JSON string (pass to @simplewebauthn/browser)
+
+
+class PasskeyRegisterVerify(BaseModel):
+    challenge_id: str
+    credential: dict
+    name: Optional[str] = Field(default=None, max_length=100)
+
+
+class PasskeyLoginVerify(BaseModel):
+    challenge_id: str
+    credential: dict
+
+
+class PasskeyRename(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class PasskeyOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    backed_up: bool
+    created_at: Optional[datetime] = None
+    last_used_at: Optional[datetime] = None
+
+
+# ---------------------------------------------------------------------------
 # Facilities
 # ---------------------------------------------------------------------------
 class FacilityOut(BaseModel):

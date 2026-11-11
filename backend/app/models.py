@@ -84,6 +84,9 @@ class User(Base):
 
     facility         : Mapped[Optional["Facility"]] = relationship(back_populates="users")
     login_logs       : Mapped[List["LoginLog"]]     = relationship(back_populates="user")
+    passkeys         : Mapped[List["PasskeyCredential"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -94,6 +97,41 @@ class User(Base):
 
     def __repr__(self) -> str:
         return f"<User {self.email} ({self.role})>"
+
+
+# ---------------------------------------------------------------------------
+# PasskeyCredential (WebAuthn / FIDO2 passkeys registered by a user)
+# ---------------------------------------------------------------------------
+class PasskeyCredential(Base):
+    __tablename__ = "passkey_credentials"
+
+    id               : Mapped[int]           = mapped_column(Integer, primary_key=True)
+    user_id          : Mapped[int]           = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    credential_id    : Mapped[bytes]         = mapped_column(LargeBinary, nullable=False, unique=True)
+    public_key       : Mapped[bytes]         = mapped_column(LargeBinary, nullable=False)
+    sign_count       : Mapped[int]           = mapped_column(BigInteger, nullable=False, default=0)
+    name             : Mapped[str]           = mapped_column(String(100), nullable=False, default="Passkey")
+    transports       : Mapped[Optional[list]] = mapped_column(JSONB)
+    backed_up        : Mapped[bool]          = mapped_column(Boolean, nullable=False, default=False)
+    created_at       : Mapped[datetime]      = mapped_column(TIMESTAMPTZ, server_default=func.now())
+    last_used_at     : Mapped[Optional[datetime]] = mapped_column(TIMESTAMPTZ)
+
+    user             : Mapped["User"] = relationship(back_populates="passkeys")
+
+    __table_args__ = (Index("idx_passkey_user", "user_id"),)
+
+
+# ---------------------------------------------------------------------------
+# WebAuthnChallenge (single-use, short-lived challenges for passkey ceremonies)
+# ---------------------------------------------------------------------------
+class WebAuthnChallenge(Base):
+    __tablename__ = "webauthn_challenges"
+
+    id               : Mapped[str]           = mapped_column(String(64), primary_key=True)
+    challenge        : Mapped[bytes]         = mapped_column(LargeBinary, nullable=False)
+    purpose          : Mapped[str]           = mapped_column(String(20), nullable=False)  # 'register' | 'login'
+    user_id          : Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    expires_at       : Mapped[datetime]      = mapped_column(TIMESTAMPTZ, nullable=False)
 
 
 # ---------------------------------------------------------------------------

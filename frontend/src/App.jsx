@@ -8,6 +8,7 @@ import DhaSync from "./pages/DhaSync";
 import Analytics from "./pages/Analytics";
 import LoginActivity from "./pages/LoginActivity";
 import FacilitySettings from "./pages/FacilitySettings";
+import Security from "./pages/Security";
 
 export default function App() {
   return (
@@ -22,6 +23,7 @@ export default function App() {
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/login-activity" element={<LoginActivity />} />
           <Route path="/facility-settings" element={<FacilitySettings />} />
+          <Route path="/security" element={<Security />} />
         </Route>
       </Route>
 

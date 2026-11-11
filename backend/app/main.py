@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .database import SessionLocal, init_db
-from .routers import analytics, auth, clinical_profiles, dha_sync, facilities, reports
+from .routers import analytics, auth, clinical_profiles, dha_sync, facilities, passkeys, reports
 from .seed import run_seed
 
 settings = get_settings()
@@ -45,6 +45,7 @@ def health_check():
 
 
 app.include_router(auth.router)
+app.include_router(passkeys.router)
 app.include_router(clinical_profiles.router)
 app.include_router(dha_sync.router)
 app.include_router(analytics.router)

@@ -1,9 +1,30 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { browserSupportsWebAuthn } from "@simplewebauthn/browser";
 import { useAuth } from "../context/AuthContext";
 
 export default function Login() {
-  const { login } = useAuth();
+  const { login, loginWithPasskey } = useAuth();
+  const passkeysSupported = browserSupportsWebAuthn();
+  const [passkeyLoading, setPasskeyLoading] = useState(false);
+
+  const handlePasskey = async () => {
+    setError(null);
+    setPasskeyLoading(true);
+    try {
+      await loginWithPasskey();
+      navigate("/", { replace: true });
+    } catch (err) {
+      // User closed the browser prompt — not an error worth shouting about.
+      if (err?.name === "NotAllowedError" || err?.name === "AbortError") {
+        setError("Passkey sign-in was cancelled.");
+      } else {
+        setError(err.response?.data?.detail || "Passkey sign-in failed.");
+      }
+    } finally {
+      setPasskeyLoading(false);
+    }
+  };
   const navigate = useNavigate();
 
   const [email, setEmail] = useState("admin@ghafapp.local");
@@ -65,6 +86,24 @@ export default function Login() {
             {loading ? "Signing in…" : "Sign in"}
           </button>
         </form>
+
+        {passkeysSupported && (
+          <>
+            <div className="my-4 flex items-center gap-3 text-xs text-slate-400">
+              <div className="h-px flex-1 bg-slate-200" />
+              or
+              <div className="h-px flex-1 bg-slate-200" />
+            </div>
+            <button
+              type="button"
+              onClick={handlePasskey}
+              disabled={passkeyLoading || loading}
+              className="w-full rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
+            >
+              {passkeyLoading ? "Waiting for passkey…" : "Sign in with a passkey"}
+            </button>
+          </>
+        )}
 
         <p className="mt-6 text-center text-xs text-slate-400">
           Default seeded admin: admin@ghafapp.local / ChangeMe123!

@@ -77,6 +77,12 @@ ACCESS_TOKEN_EXPIRE_MINUTES=480
 # Same-origin via IIS reverse proxy — leave as your public site URL
 CORS_ORIGINS=https://app.ghafservices.com
 
+# Passkeys (WebAuthn). RP ID = bare hostname users see; ORIGINS = full URL(s).
+# Passkeys are bound to the RP ID — changing it later invalidates every passkey.
+WEBAUTHN_RP_ID=app.ghafservices.com
+WEBAUTHN_RP_NAME=Ghaf App
+WEBAUTHN_ORIGINS=https://app.ghafservices.com
+
 # Metabase static embedding (Analytics & Financial Insights tab)
 METABASE_SITE_URL=https://metabase.ghafservices.com
 METABASE_SECRET_KEY=<embedding secret from Metabase Admin > Settings > Embedding>
