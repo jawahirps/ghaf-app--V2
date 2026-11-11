@@ -86,19 +86,31 @@ def _store_challenge(db: Session, challenge: bytes, purpose: str, user_id: Optio
 
 
 def _consume_challenge(db: Session, challenge_id: str, purpose: str, user_id: Optional[int]) -> bytes:
-    """Fetch and delete a challenge (single use). Raises 400 if missing/expired/mismatched."""
+    """Fetch and delete a challenge (single use). Raises 400 if missing/expired/mismatched.
+
+    Atomic under concurrency: only the request whose DELETE actually removes the
+    row may use it. A concurrent request with the same challenge_id blocks on the
+    row lock (Postgres) or the write lock (SQLite), then deletes 0 rows and is
+    rejected.
+    """
     row = db.get(WebAuthnChallenge, challenge_id)
+    deleted = 0
     if row is not None:
-        db.delete(row)
+        challenge, row_purpose, row_user_id, expires_at = row.challenge, row.purpose, row.user_id, row.expires_at
+        deleted = (
+            db.query(WebAuthnChallenge)
+            .filter(WebAuthnChallenge.id == challenge_id)
+            .delete(synchronize_session=False)
+        )
         db.commit()
     if (
-        row is None
-        or row.purpose != purpose
-        or row.user_id != user_id
-        or _as_utc(row.expires_at) < _utcnow()
+        deleted != 1
+        or row_purpose != purpose
+        or row_user_id != user_id
+        or _as_utc(expires_at) < _utcnow()
     ):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Passkey request expired. Please try again.")
-    return row.challenge
+    return challenge
 
 
 def _transports(raw: Optional[list]) -> Optional[List[AuthenticatorTransport]]:
