@@ -147,6 +147,21 @@ The Analytics tab renders Metabase dashboards inside `<iframe>`s using
 Until `METABASE_SECRET_KEY` is set, the Analytics tab shows a placeholder
 message per dashboard instead of failing the whole page.
 
+## Passkeys
+
+Users can add passkeys (Touch ID, Face ID, Windows Hello, phone) from the
+**Security** page and then use **Sign in with a passkey** on the login screen.
+Password login keeps working. Endpoints live under `/api/auth/passkeys`
+(`register/options|verify`, `login/options|verify`, list/rename/delete).
+
+- Settings: `WEBAUTHN_RP_ID` (default `localhost`), `WEBAUTHN_RP_NAME`,
+  `WEBAUTHN_ORIGINS` (default `http://localhost:5173`). Browsers only allow
+  passkeys on `localhost` or HTTPS.
+- Tables `passkey_credentials` and `webauthn_challenges` are created
+  automatically on startup by `init_db()`.
+- Passkey sign-ins are recorded in `login_logs`; successful ones carry a
+  `[passkey]` prefix in `user_agent`.
+
 ## Default roles
 
 `admin`, `billing_manager`, `clinician`, `staff` — enforced via

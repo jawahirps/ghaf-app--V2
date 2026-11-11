@@ -27,6 +27,18 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: str = "http://localhost:5173"
 
+    # Passkeys (WebAuthn). RP ID must be the bare domain the browser sees
+    # (e.g. "app.ghafservices.com"), and every origin users sign in from must
+    # be listed in WEBAUTHN_ORIGINS (comma-separated, scheme + host + port).
+    WEBAUTHN_RP_ID: str = "localhost"
+    WEBAUTHN_RP_NAME: str = "Ghaf App"
+    WEBAUTHN_ORIGINS: str = "http://localhost:5173"
+    WEBAUTHN_CHALLENGE_TTL_SECONDS: int = 300
+
+    @property
+    def webauthn_origins_list(self) -> List[str]:
+        return [o.strip() for o in self.WEBAUTHN_ORIGINS.split(",") if o.strip()]
+
     # Metabase embedding (Analytics & Financial Insights tab)
     METABASE_SITE_URL: str = "http://localhost:3000"
     METABASE_SECRET_KEY: str = ""

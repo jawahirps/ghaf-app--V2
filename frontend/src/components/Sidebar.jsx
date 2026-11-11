@@ -7,6 +7,7 @@ const navItems = [
   { to: "/analytics", label: "Analytics & Financial Insights" },
   { to: "/facility-settings", label: "Facility Settings" },
   { to: "/login-activity", label: "Login Activity" },
+  { to: "/security", label: "Security" },
 ];
 
 const linkClasses = ({ isActive }) =>
